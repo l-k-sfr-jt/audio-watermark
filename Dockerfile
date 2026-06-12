@@ -19,8 +19,13 @@ RUN yum install -y tar xz && \
     yum clean all
 
 # --- Python dependencies ----------------------------------------------------
+# Upgrade pip first so it understands current manylinux wheel tags, then force
+# binary-only installs. The Lambda base image has no C compiler, so if pip ever
+# tries to build a package (e.g. numpy) from source the build fails. Pinned
+# versions in requirements.txt all ship prebuilt wheels, so this never compiles.
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir --only-binary=:all: -r requirements.txt
 
 # --- Application code --------------------------------------------------------
 COPY src/ ${LAMBDA_TASK_ROOT}/src/

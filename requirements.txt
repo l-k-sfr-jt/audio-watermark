@@ -1,6 +1,6 @@
-numpy
-scipy
-soundfile
-pydub
-boto3
-pytest
+numpy==1.26.4
+scipy==1.13.1
+soundfile==0.12.1
+pydub==0.25.1
+boto3==1.34.162
+pytest==8.2.2
