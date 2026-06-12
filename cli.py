@@ -1,8 +1,10 @@
 """Local CLI for embed / detect / roundtrip-test without any AWS dependency."""
 
 import argparse
+import os
 import shutil
 import sys
+import tempfile
 
 from src.watermark import detect_watermark, embed_watermark
 
@@ -32,18 +34,23 @@ def cmd_roundtrip(args: argparse.Namespace) -> None:
     from pydub import AudioSegment
 
     print(f"Embedding watermark (user_id={args.user_id}) …")
-    wm_path = embed_watermark(args.input, args.user_id)
-    print(f"  → {wm_path}")
 
-    results = []
-    for bitrate in (64, 128):
-        mp3_path = wm_path.replace(".wav", f"_{bitrate}k.mp3")
-        AudioSegment.from_wav(wm_path).export(mp3_path, format="mp3", bitrate=f"{bitrate}k")
-        detected = detect_watermark(mp3_path)
-        ok = detected == args.user_id
-        results.append((bitrate, detected, ok))
-        status = "PASS" if ok else "FAIL"
-        print(f"  [{status}] {bitrate} kbps — expected {args.user_id}, detected {detected}")
+    # All intermediate files go into a temp directory so nothing is left
+    # behind in the input directory after the test completes.
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        wm_path = os.path.join(tmp_dir, "watermarked.wav")
+        embed_watermark(args.input, args.user_id, wm_path)
+        print(f"  Embedded → {wm_path}")
+
+        results = []
+        for bitrate in (64, 128):
+            mp3_path = os.path.join(tmp_dir, f"test_{bitrate}k.mp3")
+            AudioSegment.from_wav(wm_path).export(mp3_path, format="mp3", bitrate=f"{bitrate}k")
+            detected = detect_watermark(mp3_path)
+            ok = detected == args.user_id
+            results.append((bitrate, detected, ok))
+            status = "PASS" if ok else "FAIL"
+            print(f"  [{status}] {bitrate} kbps — expected {args.user_id}, detected {detected}")
 
     if not all(ok for _, _, ok in results):
         sys.exit(1)

@@ -1,5 +1,4 @@
 import os
-import tempfile
 
 import numpy as np
 import soundfile as sf
@@ -15,12 +14,27 @@ ALPHA = 0.025
 
 _BAND_WIDTH = FREQ_HIGH - FREQ_LOW  # 350
 
+# Pre-compute all PN sequences once at import time — eliminates 512 per-call
+# RNG constructions per embed+detect cycle. Seeded by block index so embed and
+# detect always use identical sequences without any shared state.
+_PN_SEQUENCES: list[np.ndarray] = [
+    np.random.default_rng(seed=b).choice(np.array([-1.0, 1.0]), size=_BAND_WIDTH)
+    for b in range(NUM_BLOCKS)
+]
+
 
 def _load_mono_float(path: str) -> tuple[np.ndarray, int]:
-    """Load any audio file as mono float64 in [-1.0, 1.0]."""
+    """Load any audio file as mono float64 in [-1.0, 1.0].
+
+    soundfile handles WAV/FLAC/OGG natively.  MP3 (and anything else
+    libsndfile can't read) falls back to pydub/ffmpeg.  Only format errors
+    trigger the fallback — OS-level errors (missing file, permission denied)
+    are re-raised immediately so callers see the real cause.
+    """
     try:
         samples, sr = sf.read(path, always_2d=False, dtype="float64")
-    except Exception:
+    except sf.SoundFileError:
+        # libsndfile cannot decode this format (e.g. MP3) — try pydub/ffmpeg
         seg = AudioSegment.from_file(path)
         seg = seg.set_channels(1)
         raw = np.array(seg.get_array_of_samples(), dtype=np.float64)
@@ -31,17 +45,6 @@ def _load_mono_float(path: str) -> tuple[np.ndarray, int]:
     if samples.ndim == 2:
         samples = samples.mean(axis=1)
     return samples, sr
-
-
-def _pn_sequence(block_index: int) -> np.ndarray:
-    """Deterministic PN sequence (±1 values) for a given block index.
-
-    Raw ±1 (not unit-norm) so that correlating across all BAND_WIDTH
-    coefficients reduces noise by sqrt(BAND_WIDTH), giving adequate SNR
-    even against white-noise host signals at ALPHA=0.025.
-    """
-    rng = np.random.default_rng(seed=block_index)
-    return rng.choice(np.array([-1.0, 1.0]), size=_BAND_WIDTH)
 
 
 def embed_watermark(input_path: str, user_id: int, output_path: str | None = None) -> str:
@@ -59,9 +62,8 @@ def embed_watermark(input_path: str, user_id: int, output_path: str | None = Non
     for b in range(NUM_BLOCKS):
         bit_val = bits[b // REPETITIONS]
         start = b * BLOCK_SIZE
-        block = out[start : start + BLOCK_SIZE]
-        coeffs = dct(block, type=2, norm="ortho")
-        coeffs[FREQ_LOW:FREQ_HIGH] += ALPHA * bit_val * _pn_sequence(b)
+        coeffs = dct(out[start : start + BLOCK_SIZE], type=2, norm="ortho")
+        coeffs[FREQ_LOW:FREQ_HIGH] += ALPHA * bit_val * _PN_SEQUENCES[b]
         out[start : start + BLOCK_SIZE] = idct(coeffs, type=2, norm="ortho")
 
     out = np.clip(out, -1.0, 1.0)
@@ -85,10 +87,9 @@ def detect_watermark(input_path: str) -> int:
     correlations = np.zeros(NUM_BLOCKS)
     for b in range(NUM_BLOCKS):
         start = b * BLOCK_SIZE
-        block = samples[start : start + BLOCK_SIZE]
-        coeffs = dct(block, type=2, norm="ortho")
+        coeffs = dct(samples[start : start + BLOCK_SIZE], type=2, norm="ortho")
         # Normalise by band width: averages 350 coefficients → noise ∝ 1/√N
-        correlations[b] = np.dot(coeffs[FREQ_LOW:FREQ_HIGH], _pn_sequence(b)) / _BAND_WIDTH
+        correlations[b] = np.dot(coeffs[FREQ_LOW:FREQ_HIGH], _PN_SEQUENCES[b]) / _BAND_WIDTH
 
     recovered = []
     for bit_idx in range(32):

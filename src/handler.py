@@ -9,7 +9,16 @@ from src import notify, storage, watermark
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+# Stricter than the previous regex: requires 2+ char TLD, rejects consecutive
+# dots and invalid leading/trailing chars in each label.
+_EMAIL_RE = re.compile(
+    r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9][a-zA-Z0-9\-]*(\.[a-zA-Z0-9\-]+)*\.[a-zA-Z]{2,}$"
+)
+
+# order_id must be alphanumeric + hyphens/underscores only — it is embedded
+# directly in the S3 key, so arbitrary chars (slashes, spaces, dots) would
+# create malformed keys or unexpected S3 "directories".
+_ORDER_ID_RE = re.compile(r"^[A-Za-z0-9_\-]+$")
 
 
 def _parse_event(event: dict) -> dict:
@@ -23,15 +32,29 @@ def _parse_event(event: dict) -> dict:
     email = body.get("email", "")
     order_id = body.get("order_id", "")
 
+    # Coerce numeric floats sent by lenient serialisers (e.g. 4582.0 → 4582)
+    if isinstance(user_id, float) and user_id.is_integer():
+        user_id = int(user_id)
+
     errors = []
+
     if not s3_key:
         errors.append("s3_key is required")
+    elif s3_key.startswith("/") or ".." in s3_key.split("/"):
+        # Reject absolute paths and directory-traversal attempts.
+        # S3 itself doesn't resolve ".." but downstream tooling might.
+        errors.append("s3_key must be a relative path with no traversal (no '..' segments)")
+
     if not isinstance(user_id, int) or not (0 <= user_id < 2**32):
         errors.append("user_id must be a 32-bit non-negative integer")
+
     if not _EMAIL_RE.match(email):
         errors.append("email is not a valid address")
+
     if not order_id:
         errors.append("order_id is required")
+    elif not _ORDER_ID_RE.match(order_id):
+        errors.append("order_id must contain only letters, digits, hyphens, and underscores")
 
     if errors:
         raise ValueError("; ".join(errors))
