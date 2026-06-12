@@ -22,7 +22,7 @@ if [[ -n "$BUCKET" && "$BUCKET" != "None" ]]; then
   aws s3 rm "s3://$BUCKET" --recursive --region "$REGION" || true
 fi
 
-echo "==> Deleting stack '$STACK' (Lambda, API, SES identity, bucket, ECR repo)…"
+echo "==> Deleting stack '${STACK}' (Lambda, API, SES identity, bucket, ECR repo)..."
 sam delete --stack-name "$STACK" --region "$REGION" --no-prompts
 
 echo "Done. All project resources removed."

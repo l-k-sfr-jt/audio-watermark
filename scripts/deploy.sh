@@ -17,11 +17,11 @@ fi
 
 cd "$(dirname "$0")/.."
 
-echo "==> Building container image (this is slow the first time)…"
+echo "==> Building container image (this is slow the first time)..."
 sam build
 
 echo
-echo "==> Deploying stack '$STACK' to $REGION…"
+echo "==> Deploying stack '${STACK}' to ${REGION}..."
 # --guided on the very first deploy lets SAM record any missing settings; on
 # subsequent runs samconfig.toml supplies them and this is non-interactive.
 if aws cloudformation describe-stacks --stack-name "$STACK" --region "$REGION" >/dev/null 2>&1; then
