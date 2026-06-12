@@ -1,0 +1,49 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Forensic audio watermarking service — embeds user_id into audiobook files
+
+# DO NOT deploy this template yet. Review with `sam validate` only.
+# Next phase: add IAM policies, VPC config, and API Gateway integration.
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: S3 bucket holding master audio files and temp watermarked output
+  SesFromEmail:
+    Type: String
+    Description: SES-verified sender address for download notification emails
+
+Globals:
+  Function:
+    Runtime: python3.11
+    MemorySize: 1024
+    Timeout: 60
+    Environment:
+      Variables:
+        BUCKET_NAME: !Ref BucketName
+        SES_FROM_EMAIL: !Ref SesFromEmail
+
+Resources:
+  AudioWatermarkFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/handler.lambda_handler
+      Description: Watermarks an audiobook with a buyer user_id and emails a presigned download URL
+      # Policies to add before deployment:
+      #   - S3ReadPolicy: { BucketName: !Ref BucketName }
+      #   - S3WritePolicy: { BucketName: !Ref BucketName }
+      #   - SESCrudPolicy: { IdentityName: !Ref SesFromEmail }
+      Events:
+        WatermarkApi:
+          Type: Api
+          Properties:
+            Path: /watermark
+            Method: post
+
+Outputs:
+  WatermarkFunctionArn:
+    Description: Lambda function ARN
+    Value: !GetAtt AudioWatermarkFunction.Arn
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/watermark"
