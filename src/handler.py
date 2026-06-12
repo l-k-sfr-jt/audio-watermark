@@ -4,6 +4,8 @@ import os
 import re
 import tempfile
 
+from botocore.exceptions import ClientError
+
 from src import notify, storage, watermark
 
 logger = logging.getLogger(__name__)
@@ -93,6 +95,11 @@ def lambda_handler(event: dict, context) -> dict:  # noqa: ANN001
         # 2. Download from S3
         try:
             storage.download_from_s3(bucket, s3_key, input_path)
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code in ("NoSuchKey", "NoSuchBucket", "404"):
+                return _error(404, f"Source audio not found in S3: {s3_key}")
+            return _error(500, f"S3 download failed for key '{s3_key}': {exc}")
         except Exception as exc:
             return _error(500, f"S3 download failed for key '{s3_key}': {exc}")
 

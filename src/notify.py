@@ -1,4 +1,23 @@
 import boto3
+from botocore.config import Config
+
+# Same retry/timeout posture as storage: retry transient SES errors, fail fast
+# on hangs to respect the Lambda timeout.
+_CONFIG = Config(
+    retries={"total_max_attempts": 3, "mode": "standard"},
+    connect_timeout=5,
+    read_timeout=15,
+)
+
+# Single SES client, created lazily and reused (see storage._s3 for rationale).
+_ses_client = None
+
+
+def _ses():
+    global _ses_client
+    if _ses_client is None:
+        _ses_client = boto3.client("ses", config=_CONFIG)
+    return _ses_client
 
 
 def send_download_email(
@@ -17,8 +36,7 @@ def send_download_email(
         f"Thank you for your order."
     )
 
-    ses = boto3.client("ses")
-    ses.send_email(
+    _ses().send_email(
         Source=from_address,
         Destination={"ToAddresses": [to_address]},
         Message={

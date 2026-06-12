@@ -13,14 +13,19 @@ REPETITIONS = 8
 ALPHA = 0.025
 
 _BAND_WIDTH = FREQ_HIGH - FREQ_LOW  # 350
+_REQUIRED = BLOCK_SIZE * NUM_BLOCKS
 
-# Pre-compute all PN sequences once at import time — eliminates 512 per-call
-# RNG constructions per embed+detect cycle. Seeded by block index so embed and
-# detect always use identical sequences without any shared state.
-_PN_SEQUENCES: list[np.ndarray] = [
-    np.random.default_rng(seed=b).choice(np.array([-1.0, 1.0]), size=_BAND_WIDTH)
-    for b in range(NUM_BLOCKS)
-]
+# Pre-compute all PN sequences once at import time as a single (NUM_BLOCKS,
+# _BAND_WIDTH) matrix. Seeded by block index so embed and detect always use
+# identical sequences with no shared state, and so the whole watermark can be
+# applied with vectorised array ops instead of a per-block Python loop.
+_PN_MATRIX = np.stack(
+    [np.random.default_rng(seed=b).choice(np.array([-1.0, 1.0]), size=_BAND_WIDTH)
+     for b in range(NUM_BLOCKS)]
+)
+
+# Which payload bit each block carries: blocks [0..7]→bit 0, [8..15]→bit 1, …
+_BLOCK_TO_BIT = np.arange(NUM_BLOCKS) // REPETITIONS
 
 
 def _load_mono_float(path: str) -> tuple[np.ndarray, int]:
@@ -51,20 +56,21 @@ def embed_watermark(input_path: str, user_id: int, output_path: str | None = Non
     """Embed user_id into the first ~12 s of audio. Returns path to WAV output."""
     samples, sr = _load_mono_float(input_path)
 
-    required = BLOCK_SIZE * NUM_BLOCKS
-    if len(samples) < required:
-        samples = np.pad(samples, (0, required - len(samples)))
+    if len(samples) < _REQUIRED:
+        samples = np.pad(samples, (0, _REQUIRED - len(samples)))
 
     bits = np.array([(user_id >> i) & 1 for i in range(32)], dtype=np.float64)
     bits = bits * 2 - 1  # map {0,1} → {-1,+1}
+    bit_per_block = bits[_BLOCK_TO_BIT]  # (NUM_BLOCKS,)
 
     out = samples.copy()
-    for b in range(NUM_BLOCKS):
-        bit_val = bits[b // REPETITIONS]
-        start = b * BLOCK_SIZE
-        coeffs = dct(out[start : start + BLOCK_SIZE], type=2, norm="ortho")
-        coeffs[FREQ_LOW:FREQ_HIGH] += ALPHA * bit_val * _PN_SEQUENCES[b]
-        out[start : start + BLOCK_SIZE] = idct(coeffs, type=2, norm="ortho")
+
+    # Reshape the embedding region into (NUM_BLOCKS, BLOCK_SIZE) and run a
+    # single batched DCT over axis=1 instead of 256 separate calls.
+    blocks = out[:_REQUIRED].reshape(NUM_BLOCKS, BLOCK_SIZE)
+    coeffs = dct(blocks, type=2, norm="ortho", axis=1)
+    coeffs[:, FREQ_LOW:FREQ_HIGH] += ALPHA * bit_per_block[:, None] * _PN_MATRIX
+    out[:_REQUIRED] = idct(coeffs, type=2, norm="ortho", axis=1).reshape(-1)
 
     out = np.clip(out, -1.0, 1.0)
     pcm = (out * 32767).astype(np.int16)
@@ -81,20 +87,17 @@ def detect_watermark(input_path: str) -> int:
     """Detect and return the embedded user_id, or -1 if signal is too short."""
     samples, _ = _load_mono_float(input_path)
 
-    if len(samples) < BLOCK_SIZE * NUM_BLOCKS:
+    if len(samples) < _REQUIRED:
         return -1
 
-    correlations = np.zeros(NUM_BLOCKS)
-    for b in range(NUM_BLOCKS):
-        start = b * BLOCK_SIZE
-        coeffs = dct(samples[start : start + BLOCK_SIZE], type=2, norm="ortho")
-        # Normalise by band width: averages 350 coefficients → noise ∝ 1/√N
-        correlations[b] = np.dot(coeffs[FREQ_LOW:FREQ_HIGH], _PN_SEQUENCES[b]) / _BAND_WIDTH
+    # Batched DCT over all blocks, then correlate each block's embedding band
+    # against its PN sequence. Normalise by band width so noise scales as 1/√N.
+    blocks = samples[:_REQUIRED].reshape(NUM_BLOCKS, BLOCK_SIZE)
+    coeffs = dct(blocks, type=2, norm="ortho", axis=1)
+    correlations = (coeffs[:, FREQ_LOW:FREQ_HIGH] * _PN_MATRIX).sum(axis=1) / _BAND_WIDTH
 
-    recovered = []
-    for bit_idx in range(32):
-        chunk = correlations[bit_idx * REPETITIONS : (bit_idx + 1) * REPETITIONS]
-        bit = 1 if np.sum(chunk) >= 0 else 0
-        recovered.append(bit)
+    # Majority vote: sum the REPETITIONS correlations per bit, take the sign.
+    votes = correlations.reshape(32, REPETITIONS).sum(axis=1)
+    recovered = (votes >= 0).astype(int)
 
-    return sum(b << i for i, b in enumerate(recovered))
+    return sum(int(b) << i for i, b in enumerate(recovered))
