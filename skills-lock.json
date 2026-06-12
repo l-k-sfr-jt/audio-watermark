@@ -1,6 +1,12 @@
 {
   "version": 1,
   "skills": {
+    "aws-sdk-python-usage": {
+      "source": "aws/agent-toolkit-for-aws",
+      "sourceType": "github",
+      "skillPath": "skills/core-skills/aws-sdk-python-usage/SKILL.md",
+      "computedHash": "cdd24e3232b66ff9c25859cd4c540d65fab74e0ddf7d5fd1b39576692463038f"
+    },
     "python-performance-optimization": {
       "source": "wshobson/agents",
       "sourceType": "github",
