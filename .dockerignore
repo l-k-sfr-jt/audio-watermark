@@ -1,0 +1,15 @@
+# Keep the image build context small and the image lean — only src/ and
+# requirements.txt are needed to run the Lambda.
+.git
+.agents
+.venv
+venv
+docs
+scripts
+tests
+samconfig.toml
+*.md
+__pycache__
+*.pyc
+.pytest_cache
+skills-lock.json

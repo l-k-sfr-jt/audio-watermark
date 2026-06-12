@@ -1,49 +1,91 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
-Description: Forensic audio watermarking service — embeds user_id into audiobook files
+Description: Forensic audio watermarking service — watermarks audiobooks with a buyer user_id
 
-# DO NOT deploy this template yet. Review with `sam validate` only.
-# Next phase: add IAM policies, VPC config, and API Gateway integration.
+# This template provisions EVERYTHING the service needs so the only manual step
+# left after `sam deploy` is clicking the SES verification link in your inbox:
+#   - S3 bucket (private, with temp/ auto-expiry)
+#   - SES sender identity (email verification)
+#   - the watermarking Lambda (container image) with least-privilege IAM
+#   - an API Gateway POST /watermark endpoint
+#
+# Deploy with the helper script:  ./scripts/deploy.sh
 
 Parameters:
-  BucketName:
-    Type: String
-    Description: S3 bucket holding master audio files and temp watermarked output
   SesFromEmail:
     Type: String
-    Description: SES-verified sender address for download notification emails
-
-Globals:
-  Function:
-    Runtime: python3.11
-    MemorySize: 1024
-    Timeout: 60
-    Environment:
-      Variables:
-        BUCKET_NAME: !Ref BucketName
-        SES_FROM_EMAIL: !Ref SesFromEmail
+    Description: >
+      Sender email address. SES emails a verification link here on first deploy;
+      until you click it, no mail can be sent from this address.
 
 Resources:
+  # ----- Storage ------------------------------------------------------------
+  AudioBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          # Watermarked outputs are throwaway: the presigned link lasts 48h, so
+          # there is no reason to keep them. Auto-delete after 2 days to control cost.
+          - Id: ExpireTempWatermarks
+            Status: Enabled
+            Prefix: temp/
+            ExpirationInDays: 2
+
+  # ----- Email --------------------------------------------------------------
+  SenderIdentity:
+    Type: AWS::SES::EmailIdentity
+    Properties:
+      EmailIdentity: !Ref SesFromEmail
+
+  # ----- Compute ------------------------------------------------------------
   AudioWatermarkFunction:
     Type: AWS::Serverless::Function
     Properties:
-      Handler: src/handler.lambda_handler
-      Description: Watermarks an audiobook with a buyer user_id and emails a presigned download URL
-      # Policies to add before deployment:
-      #   - S3ReadPolicy: { BucketName: !Ref BucketName }
-      #   - S3WritePolicy: { BucketName: !Ref BucketName }
-      #   - SESCrudPolicy: { IdentityName: !Ref SesFromEmail }
+      PackageType: Image
+      MemorySize: 1024
+      Timeout: 60
+      Architectures:
+        - x86_64        # change to arm64 to run on Graviton (cheaper, faster on Apple Silicon)
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref AudioBucket
+          SES_FROM_EMAIL: !Ref SesFromEmail
+      Policies:
+        # Read masters + write watermarked outputs, scoped to this bucket only.
+        - S3CrudPolicy:
+            BucketName: !Ref AudioBucket
+        # Send the download-link email. SES SendEmail does not support
+        # resource-level scoping cleanly, so this is action-scoped.
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ses:SendEmail
+                - ses:SendRawEmail
+              Resource: '*'
       Events:
         WatermarkApi:
           Type: Api
           Properties:
             Path: /watermark
             Method: post
+    Metadata:
+      Dockerfile: Dockerfile
+      DockerContext: .
+      DockerTag: latest
 
 Outputs:
-  WatermarkFunctionArn:
-    Description: Lambda function ARN
-    Value: !GetAtt AudioWatermarkFunction.Arn
+  BucketName:
+    Description: S3 bucket for master and watermarked audio
+    Value: !Ref AudioBucket
+  FunctionName:
+    Description: Lambda function name (used by scripts/smoke-test.sh)
+    Value: !Ref AudioWatermarkFunction
   ApiEndpoint:
-    Description: API Gateway endpoint URL
+    Description: POST endpoint for watermark requests
     Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/watermark"

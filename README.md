@@ -130,7 +130,12 @@ tests/
   sample_audio/       # Drop short test fixtures here
 cli.py          # Local CLI: embed / detect / roundtrip-test
 requirements.txt
-template.yaml   # SAM scaffold — DO NOT deploy yet
+Dockerfile      # Container-image Lambda (bundles ffmpeg for MP3 decoding)
+template.yaml   # SAM template — provisions S3 + SES + Lambda + API
+samconfig.toml  # SAM deploy defaults (region eu-central-1)
+scripts/        # check-prereqs / deploy / verify-recipient / smoke-test / teardown
+docs/
+  DEPLOYMENT.md # Zero-to-deployed AWS guide (account → live service)
 ```
 
 ---
@@ -144,66 +149,30 @@ template.yaml   # SAM scaffold — DO NOT deploy yet
 
 ---
 
-## Next steps — AWS deployment (Phase 3)
+## AWS deployment (Phase 3)
 
-Once local roundtrip tests pass on real audiobooks, the deployment sequence is:
+Full zero-to-deployed instructions — including creating the AWS account — are in
+**[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)**. The infrastructure is defined in
+`template.yaml` (S3 bucket + SES identity + container-image Lambda + API
+Gateway) and deployed with one script per stage.
 
-### Step 1 — AWS account prerequisites
-- An AWS account with CLI access configured (`aws configure`)
-- Install the SAM CLI: `brew install aws-sam-cli`
-- Verify: `sam --version`
+Quick path once you have an AWS account and `aws`/`sam`/Docker installed:
 
-### Step 2 — Create the S3 bucket
 ```bash
-aws s3 mb s3://your-audiobook-bucket --region eu-west-1
-```
-Upload a test master:
-```bash
-aws s3 cp /path/to/audiobook.mp3 s3://your-audiobook-bucket/masters/test.mp3
-```
-
-### Step 3 — Verify your SES sender email
-```bash
-aws ses verify-email-identity --email-address your@email.com --region eu-west-1
-```
-Check your inbox and click the verification link.
-
-### Step 4 — Review and complete `template.yaml`
-Before deploying, open `template.yaml` and:
-1. Uncomment the IAM policy block (S3ReadPolicy, S3WritePolicy, SESCrudPolicy)
-2. Add `CodeUri: .` under the function properties
-3. Add a `Layers` entry if you need to package numpy/scipy as a Lambda layer
-   (they exceed the 50 MB inline limit — see the note below)
-
-**Lambda layer note:** numpy + scipy + soundfile together are ~120 MB. You need
-to either:
-- Use a public [AWS-managed scientific Python layer](https://github.com/keithrozario/Klayers), or
-- Build your own: `pip install -r requirements.txt -t python/ && zip -r layer.zip python/`
-  then `aws lambda publish-layer-version ...`
-
-### Step 5 — Build and deploy
-```bash
-sam build
-sam deploy --guided
-```
-The guided wizard will ask for `BucketName` and `SesFromEmail` parameter values.
-
-### Step 6 — Test the deployed Lambda
-```bash
-aws lambda invoke \
-  --function-name AudioWatermarkFunction \
-  --payload '{"s3_key":"masters/test.mp3","user_id":4582,"email":"you@example.com","order_id":"wc-test-001"}' \
-  --cli-binary-format raw-in-base64-out \
-  response.json
-cat response.json
+./scripts/check-prereqs.sh                              # verify tooling + creds
+./scripts/deploy.sh noreply@yourdomain.com              # build image + deploy stack
+# → click the SES verification link AWS emails to that address
+./scripts/verify-recipient.sh you@example.com           # SES sandbox: verify a test inbox
+./scripts/smoke-test.sh audiobook.mp3 you@example.com   # upload, invoke, email the link
+./scripts/teardown.sh                                   # remove everything when done
 ```
 
-Expected: `{"statusCode": 200, "body": "{\"status\": \"ok\", \"watermark_id\": 4582}"}`
+The Lambda is packaged as a **container image** (`Dockerfile`) so ffmpeg and the
+scientific Python stack are bundled — no Lambda layer juggling, and MP3/WAV/FLAC
+masters all decode. Region defaults to **eu-central-1**.
 
-### Step 7 — Add API Gateway (Phase 4)
-After the Lambda works in isolation, expose it via API Gateway and integrate
-with WooCommerce. The `template.yaml` already has the `WatermarkApi` event
-scaffold — it activates automatically when you deploy.
+**Next (Phase 4):** the `/watermark` API endpoint is open by design for now;
+add an API key or Lambda authorizer before wiring it to WooCommerce.
 
 ---
 

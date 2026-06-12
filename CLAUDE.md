@@ -19,7 +19,11 @@ tests/
   sample_audio/       # Short test .mp3 / .wav fixtures
 cli.py            # Local CLI — runs embed/detect/roundtrip without AWS
 requirements.txt  # numpy, scipy, soundfile, pydub, boto3, pytest
-template.yaml     # SAM scaffold — DO NOT deploy; reference only
+Dockerfile        # Container-image Lambda — bundles ffmpeg + scientific stack
+template.yaml     # SAM template — provisions S3 + SES + Lambda + API (Phase 3)
+samconfig.toml    # SAM deploy defaults (region eu-central-1)
+scripts/          # check-prereqs / deploy / verify-recipient / smoke-test / teardown
+docs/DEPLOYMENT.md # Zero-to-deployed AWS guide
 README.md
 ```
 
@@ -82,12 +86,16 @@ Lambda config: **1024 MB memory, 60 s timeout**.
 1. `watermark.py` must never import `boto3` or any AWS SDK — it must run
    identically in Lambda and the local CLI without AWS credentials.
 2. All S3 and SES calls live exclusively in `storage.py` and `notify.py`.
-3. `template.yaml` is scaffold only — do not run `sam deploy` in this phase.
+3. The Lambda is packaged as a **container image** (`Dockerfile`), not zip —
+   ffmpeg and scipy are bundled. Deploy via `scripts/deploy.sh`, never by
+   editing live AWS resources by hand.
 
 ## Current Phase Scope
 
 In scope: local watermark implementation (`watermark.py`, `cli.py`, `tests/`),
-Lambda handler wiring (`handler.py`, `storage.py`, `notify.py`), SAM scaffold.
+Lambda handler wiring (`handler.py`, `storage.py`, `notify.py`), and Phase 3
+deployment (`Dockerfile`, `template.yaml`, `scripts/`, `docs/DEPLOYMENT.md`).
+The `/watermark` API is intentionally unauthenticated for now.
 
-Out of scope until later phases: AWS deployment, API Gateway, WordPress/WooCommerce
-plugin.
+Out of scope until later phases: API authentication/authorizer,
+WordPress/WooCommerce plugin integration.
