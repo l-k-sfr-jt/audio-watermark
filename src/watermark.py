@@ -4,6 +4,7 @@ import numpy as np
 import soundfile as sf
 from pydub import AudioSegment
 from scipy.fft import dct, idct
+from scipy.ndimage import maximum_filter1d
 
 BLOCK_SIZE = 2048
 NUM_BLOCKS = 256
@@ -12,17 +13,26 @@ FREQ_HIGH = 500
 REPETITIONS = 8
 USER_ID_BITS = 32
 
-# Embedding strength is now PERCEPTUAL: the watermark amplitude in each block is
-# ALPHA times that block's own energy in the embedding band. Because the mark is
-# a fixed fraction of whatever signal is already there, it stays masked
-# (inaudible) in loud passages and fades out in quiet ones — instead of being
-# added at a fixed absolute level that stands out as audible "graining" during
-# the near-silent intro common to audiobooks.
-ALPHA = 0.15
-# Floor on the per-block band energy so a near-silent block still carries a
-# faint, detectable mark. ~30x quieter than the old fixed scheme, so any residual
-# noise in true silence is effectively inaudible while detection degrades
-# gracefully rather than dropping the block entirely.
+# Embedding is shaped by a PERCEPTUAL MASKING ENVELOPE. For each block we build
+# an envelope by spreading the host's band magnitude across neighbouring bins
+# (a crude frequency-masking model: a tone masks nearby frequencies too). The
+# watermark on each coefficient is ALPHA times that envelope, so the mark is
+# loud near the tones that hide it and fades to near-zero in the quiet gaps
+# between them — where flat broadband noise would otherwise be audible as
+# "graining". This is what keeps it inaudible on tonal/music content; speech is
+# noise-like and forgiving, but music exposes any energy added between its tones.
+#
+# Detection then WHITENS: it divides each coefficient by the same envelope
+# before correlating, so the few loud host tones can no longer swamp the vote
+# (the failure mode of naive multiplicative embedding). See detect_watermark.
+ALPHA = 0.05
+# Bins to spread the masking envelope over (each side). 1 DCT bin ≈ 10.8 Hz, so
+# ~11 bins ≈ 120 Hz — roughly local critical-band masking. Smaller = the mark
+# hugs the tones more tightly (quieter) but gives detection less to work with.
+SPREAD_BINS = 11
+# Envelope floor so coefficients in deep gaps / silence still carry a faint,
+# detectable mark without exposing audible noise. Keeps detection graceful on
+# very quiet or sparse material instead of dropping those blocks entirely.
 SILENCE_FLOOR = 0.001
 
 _BAND_WIDTH = FREQ_HIGH - FREQ_LOW  # 350
@@ -42,6 +52,18 @@ _PN_MATRIX = np.stack(
 # the whole 12 s window (every ~1.5 s) rather than clustered into one contiguous
 # stretch. A brief quiet intro therefore can't knock out the low-numbered bits.
 _BLOCK_TO_BIT = np.arange(NUM_BLOCKS) % USER_ID_BITS
+
+
+def _masking_envelope(band: np.ndarray) -> np.ndarray:
+    """Per-coefficient masking envelope for a batch of band slices.
+
+    Spreads each block's band magnitude across +/- SPREAD_BINS neighbours (a
+    tone masks nearby frequencies), then floors it. Used identically by embed
+    (to shape the mark) and detect (to whiten the host out). `band` is
+    (NUM_BLOCKS, _BAND_WIDTH); the envelope has the same shape.
+    """
+    spread = maximum_filter1d(np.abs(band), size=2 * SPREAD_BINS + 1, axis=1, mode="nearest")
+    return np.maximum(spread, SILENCE_FLOOR)
 
 
 def _load_mono_float(path: str) -> tuple[np.ndarray, int]:
@@ -86,13 +108,12 @@ def embed_watermark(input_path: str, user_id: int, output_path: str | None = Non
     blocks = out[:_REQUIRED].reshape(NUM_BLOCKS, BLOCK_SIZE)
     coeffs = dct(blocks, type=2, norm="ortho", axis=1)
 
-    # Per-block RMS of the host's existing energy in the embedding band, floored
-    # so silence still carries a faint mark. The watermark is scaled by this so
-    # it is always a fixed fraction of the local signal (masked → inaudible).
+    # Shape the mark by the masking envelope so it sits under the audio's own
+    # spectrum: loud near the tones that hide it, near-silent in the gaps.
     band = coeffs[:, FREQ_LOW:FREQ_HIGH]
-    local_gain = np.maximum(np.sqrt(np.mean(band ** 2, axis=1)), SILENCE_FLOOR)
+    envelope = _masking_envelope(band)
     coeffs[:, FREQ_LOW:FREQ_HIGH] += (
-        ALPHA * bit_per_block[:, None] * local_gain[:, None] * _PN_MATRIX
+        ALPHA * bit_per_block[:, None] * envelope * _PN_MATRIX
     )
     out[:_REQUIRED] = idct(coeffs, type=2, norm="ortho", axis=1).reshape(-1)
 
@@ -115,10 +136,17 @@ def detect_watermark(input_path: str) -> int:
         return -1
 
     # Batched DCT over all blocks, then correlate each block's embedding band
-    # against its PN sequence. Normalise by band width so noise scales as 1/√N.
+    # against its PN sequence. WHITEN first: divide each coefficient by the same
+    # masking envelope used at embed time. Where the host is loud (tones), the
+    # ratio is bounded ~O(1) instead of dominating, so a few big tonal
+    # coefficients can no longer swamp the vote. The mark (which was ALPHA *
+    # envelope * PN) whitens to a clean ALPHA * PN, while the host whitens to
+    # bounded noise that averages out across the band.
     blocks = samples[:_REQUIRED].reshape(NUM_BLOCKS, BLOCK_SIZE)
     coeffs = dct(blocks, type=2, norm="ortho", axis=1)
-    correlations = (coeffs[:, FREQ_LOW:FREQ_HIGH] * _PN_MATRIX).sum(axis=1) / _BAND_WIDTH
+    band = coeffs[:, FREQ_LOW:FREQ_HIGH]
+    whitened = band / _masking_envelope(band)
+    correlations = (whitened * _PN_MATRIX).sum(axis=1) / _BAND_WIDTH
 
     # Sum each bit's REPETITIONS correlations, then take the sign. Blocks are
     # interleaved (block i holds bit i % USER_ID_BITS), so reshaping to

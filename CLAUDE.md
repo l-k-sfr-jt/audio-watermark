@@ -36,17 +36,21 @@ README.md
 | `FREQ_LOW`    | 150   | First DCT index in embedding band                 |
 | `FREQ_HIGH`   | 500   | Last DCT index in embedding band (mid-freq)       |
 | `REPETITIONS` | 8     | Bit repetition factor; majority vote on detection |
-| `ALPHA`       | 0.15  | Perceptual strength: mark amplitude as a fraction of each block's local band energy |
-| `SILENCE_FLOOR` | 0.001 | Min band energy so near-silent blocks still carry a faint, detectable mark |
+| `ALPHA`       | 0.05  | Embedding strength: mark amplitude as a fraction of the per-coefficient masking envelope |
+| `SPREAD_BINS` | 11    | Frequency-masking spread (each side); ~120 Hz at 44.1 kHz |
+| `SILENCE_FLOOR` | 0.001 | Envelope floor so deep gaps / silence still carry a faint, detectable mark |
 
 The watermark encodes a 32-bit integer across `NUM_BLOCKS` DCT blocks, each
 `BLOCK_SIZE` samples. Each bit's 8 repetitions are **interleaved** across the
 whole window (block `i` carries bit `i % 32`), so a quiet intro can't wipe out
-any single bit. Embedding is **perceptual**: the mark is scaled to each block's
-local band energy (`ALPHA × local_RMS`), so it stays masked/inaudible in loud
-passages and fades out in silence instead of standing out as audible graining.
-Detection sums each bit's repetition correlations and takes the sign. Output of
-`embed_watermark()` is always WAV (PCM 16-bit).
+any single bit. Embedding is **perceptual**: a masking envelope is built per
+block by spreading the host's band magnitude across `±SPREAD_BINS` neighbours,
+and the mark is scaled to it (`ALPHA × envelope`). The mark therefore sits loud
+near the tones that mask it and near-silent in the gaps between them — key to
+staying inaudible on tonal/music content. Detection **whitens** (divides each
+coefficient by the same envelope) before correlating, so a few loud host tones
+can't swamp the vote; it then sums each bit's repetition correlations and takes
+the sign. Output of `embed_watermark()` is always WAV (PCM 16-bit).
 
 ## Development Commands
 
