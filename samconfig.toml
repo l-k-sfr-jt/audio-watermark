@@ -13,3 +13,4 @@ capabilities = "CAPABILITY_IAM"
 confirm_changeset = true
 resolve_s3 = true
 resolve_image_repos = true   # auto-create/manage the ECR repo for the container image
+disable_rollback = false     # allow CloudFormation to roll back on failure (default); override any local --guided setting
