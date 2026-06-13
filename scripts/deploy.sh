@@ -24,11 +24,18 @@ echo
 echo "==> Deploying stack '${STACK}' to ${REGION}..."
 # --guided on the very first deploy lets SAM record any missing settings; on
 # subsequent runs samconfig.toml supplies them and this is non-interactive.
+# --no-disable-rollback is forced on the command line so a stale local
+# samconfig.toml (e.g. disable_rollback=true left by an earlier --guided run)
+# can't silently disable rollback. With rollback enabled, a failed update
+# reverts to the last good state instead of getting stuck in UPDATE_FAILED,
+# and CloudFormation is permitted to perform replacement-type updates.
 if aws cloudformation describe-stacks --stack-name "$STACK" --region "$REGION" >/dev/null 2>&1; then
   sam deploy --region "$REGION" --stack-name "$STACK" \
+    --no-disable-rollback \
     --parameter-overrides "SesFromEmail=$SENDER"
 else
   sam deploy --guided --region "$REGION" --stack-name "$STACK" \
+    --no-disable-rollback \
     --parameter-overrides "SesFromEmail=$SENDER"
 fi
 
