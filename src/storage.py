@@ -1,3 +1,5 @@
+import os
+
 import boto3
 from botocore.config import Config
 
@@ -19,7 +21,11 @@ _s3_client = None
 def _s3():
     global _s3_client
     if _s3_client is None:
-        _s3_client = boto3.client("s3", config=_CONFIG)
+        _s3_client = boto3.client(
+            "s3",
+            region_name=os.environ.get("AWS_DEFAULT_REGION", "eu-central-1"),
+            config=_CONFIG,
+        )
     return _s3_client
 
 
