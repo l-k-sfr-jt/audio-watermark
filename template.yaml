@@ -66,6 +66,18 @@ Resources:
     Properties:
       EmailIdentity: !Ref SesFromEmail
 
+  # ----- API (explicit, so we can enforce an API key) ----------------------
+  # An explicit AWS::Serverless::Api resource lets us set Auth.ApiKeyRequired,
+  # which tells API Gateway to reject any request missing a valid x-api-key
+  # header before the Lambda is even cold-started. The implicit ServerlessRestApi
+  # SAM creates by default does not support this property.
+  WatermarkApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: Prod
+      Auth:
+        ApiKeyRequired: true
+
   # ----- Compute ------------------------------------------------------------
   AudioWatermarkFunction:
     Type: AWS::Serverless::Function
@@ -97,12 +109,38 @@ Resources:
         WatermarkApi:
           Type: Api
           Properties:
+            RestApiId: !Ref WatermarkApi
             Path: /watermark
             Method: post
     Metadata:
       Dockerfile: Dockerfile
       DockerContext: .
       DockerTag: latest
+
+  # ----- API key + usage plan -----------------------------------------------
+  # API Gateway enforces the key before invoking Lambda — bad requests cost
+  # nothing and produce no cold starts.
+  WatermarkApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    Properties:
+      Name: WatermarkApiKey
+      Enabled: true
+
+  WatermarkUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    Properties:
+      UsagePlanName: WatermarkUsagePlan
+      ApiStages:
+        - ApiId: !Ref WatermarkApi
+          Stage: Prod
+    DependsOn: WatermarkApiProdStage   # SAM auto-creates this resource from WatermarkApi + StageName: Prod
+
+  WatermarkUsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref WatermarkApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref WatermarkUsagePlan
 
 Outputs:
   BucketName:
@@ -113,4 +151,7 @@ Outputs:
     Value: !Ref AudioWatermarkFunction
   ApiEndpoint:
     Description: POST endpoint for watermark requests
-    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/watermark"
+    Value: !Sub "https://${WatermarkApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/watermark"
+  ApiKeyId:
+    Description: "Retrieve the key value with: aws apigateway get-api-keys --include-values --query \"items[?name=='WatermarkApiKey'].value\" --output text"
+    Value: !Ref WatermarkApiKey

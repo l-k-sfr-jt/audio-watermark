@@ -119,10 +119,27 @@ Click the link that arrives.
 ```bash
 ./scripts/smoke-test.sh ~/Downloads/sample-audiobook.mp3 you@example.com
 ```
-This uploads the file to `masters/`, invokes the Lambda, and prints the
+This uploads the file to `masters/`, invokes the Lambda directly, and prints the
 response. On `{"status": "ok", ...}`, check `you@example.com` for the download
-link (valid 48 hours). Download it and run `python cli.py detect <file>` locally
+link (valid 48 hours). Download it and run `python3 cli.py detect <file>` locally
 to confirm the embedded `user_id` (4582 by default).
+
+The script also runs a quick API key check at the end: it verifies that a
+request without `x-api-key` gets a `403`, and a request with the key gets `200`.
+
+## 🤖 Step 11 — Retrieve the API key for WooCommerce
+
+The smoke test prints the key at the end. You can also retrieve it at any time:
+
+```bash
+aws apigateway get-api-keys --include-values \
+  --query "items[?name=='WatermarkApiKey'].value" --output text \
+  --region eu-central-1
+```
+
+Store this value in your WooCommerce plugin config as the `x-api-key` header
+secret. Rotate it by updating `WatermarkApiKey` in the CloudFormation console
+(or by redeploying with a new key resource name) and updating WooCommerce.
 
 ---
 
@@ -135,8 +152,8 @@ to confirm the embedded `user_id` (4582 by default).
   email, so mail comes from `noreply@yourdomain.com` with better deliverability.
 - **Lock down IAM:** replace the `deployer` AdministratorAccess user with a
   scoped deployment role.
-- **API auth:** the `/watermark` endpoint is currently open. Before exposing it
-  to WooCommerce (Phase 4), add an API key or a Lambda authorizer.
+- **API auth:** done — `POST /watermark` requires a valid `x-api-key` header
+  (provisioned in Step 11). Wire this key into your WooCommerce plugin (Phase 5).
 
 ## Tearing it all down
 

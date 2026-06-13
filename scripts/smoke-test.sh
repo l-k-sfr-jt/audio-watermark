@@ -28,6 +28,10 @@ out() {
 
 BUCKET=$(out BucketName)
 FUNCTION=$(out FunctionName)
+API_URL=$(out ApiEndpoint)
+API_KEY_ID=$(out ApiKeyId)
+API_KEY=$(aws apigateway get-api-keys --include-values \
+  --query "items[?id=='${API_KEY_ID}'].value" --output text --region "$REGION")
 KEY="masters/$(basename "$AUDIO")"
 
 echo "==> Uploading $AUDIO → s3://$BUCKET/$KEY"
@@ -52,3 +56,27 @@ echo
 echo
 echo "If the response shows \"status\": \"ok\", check the inbox for $RECIPIENT"
 echo "for the watermarked download link (valid 48h)."
+
+echo
+echo "==> Verifying API key enforcement on $API_URL"
+HTTP_NO_KEY=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$API_URL" \
+  -H "Content-Type: application/json" -d '{}')
+if [[ "$HTTP_NO_KEY" == "403" ]]; then
+  echo "  [PASS] Request without x-api-key correctly rejected (403)"
+else
+  echo "  [FAIL] Expected 403, got $HTTP_NO_KEY — API key may not be enforced" >&2
+fi
+
+HTTP_WITH_KEY=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$API_URL" \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: $API_KEY" \
+  -d "$PAYLOAD")
+if [[ "$HTTP_WITH_KEY" == "200" ]]; then
+  echo "  [PASS] Request with x-api-key accepted (200)"
+else
+  echo "  [WARN] Request with x-api-key returned HTTP $HTTP_WITH_KEY"
+fi
+
+echo
+echo "Store the API key below in your WooCommerce plugin config (Phase 5):"
+echo "  $API_KEY"
