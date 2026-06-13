@@ -73,9 +73,11 @@ def _load_mono_float(path: str) -> tuple[np.ndarray, int]:
 
     soundfile handles WAV/FLAC/OGG natively.  MP3 (and anything else
     libsndfile can't read) falls back to pydub/ffmpeg.  Only format errors
-    trigger the fallback — OS-level errors (missing file, permission denied)
-    are re-raised immediately so callers see the real cause.
+    trigger the fallback — a missing file raises FileNotFoundError immediately
+    so callers see the real cause instead of a confusing decode traceback.
     """
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"No such audio file: {path}")
     try:
         samples, sr = sf.read(path, always_2d=False, dtype="float64")
     except sf.SoundFileError:
