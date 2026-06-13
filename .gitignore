@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Next.js test app: the `lib/` convention collides with the Python `lib/`
+# ignore above. Re-include just the web app's source lib (not node_modules).
+!web/lib/
+
