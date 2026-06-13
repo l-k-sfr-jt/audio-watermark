@@ -36,11 +36,17 @@ README.md
 | `FREQ_LOW`    | 150   | First DCT index in embedding band                 |
 | `FREQ_HIGH`   | 500   | Last DCT index in embedding band (mid-freq)       |
 | `REPETITIONS` | 8     | Bit repetition factor; majority vote on detection |
-| `ALPHA`       | 0.025 | Embedding strength — tunable, survives 64 kbps   |
+| `ALPHA`       | 0.15  | Perceptual strength: mark amplitude as a fraction of each block's local band energy |
+| `SILENCE_FLOOR` | 0.001 | Min band energy so near-silent blocks still carry a faint, detectable mark |
 
 The watermark encodes a 32-bit integer across `NUM_BLOCKS` DCT blocks, each
-`BLOCK_SIZE` samples. Detection uses majority voting across the 8 repetitions
-of each bit. Output of `embed_watermark()` is always WAV (PCM 16-bit).
+`BLOCK_SIZE` samples. Each bit's 8 repetitions are **interleaved** across the
+whole window (block `i` carries bit `i % 32`), so a quiet intro can't wipe out
+any single bit. Embedding is **perceptual**: the mark is scaled to each block's
+local band energy (`ALPHA × local_RMS`), so it stays masked/inaudible in loud
+passages and fades out in silence instead of standing out as audible graining.
+Detection sums each bit's repetition correlations and takes the sign. Output of
+`embed_watermark()` is always WAV (PCM 16-bit).
 
 ## Development Commands
 

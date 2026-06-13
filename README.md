@@ -108,7 +108,7 @@ Embedding watermark (user_id=12345) …
 ```
 
 A `[FAIL]` at 64 kbps means the audio has unusually low energy in the
-1.6–5.4 kHz DCT band. Increase `ALPHA` in `src/watermark.py` (try `0.04`)
+1.6–5.4 kHz DCT band. Increase `ALPHA` in `src/watermark.py` (try `0.2`)
 and re-test.
 
 **Listen for audibility:** open `output.wav` in any audio player and compare
@@ -180,7 +180,8 @@ add an API key or Lambda authorizer before wiring it to WooCommerce.
 
 | Parameter | Location | Effect |
 |-----------|----------|--------|
-| `ALPHA` | `src/watermark.py` | Higher = more robust, more audible. Start at 0.025, go up to 0.05 if 64 kbps fails. |
+| `ALPHA` | `src/watermark.py` | Perceptual strength — the mark is `ALPHA ×` each block's local band energy, so it tracks loudness and stays masked. Higher = more robust, more audible. Start at 0.15, go up to ~0.25 if 64 kbps fails, down toward 0.1 if you still hear it. |
+| `SILENCE_FLOOR` | `src/watermark.py` | Minimum mark level in near-silent blocks. Lower it (e.g. 0.0005) if you hear faint noise in silent intros; raise it if detection is shaky on very quiet audio. |
 | `NUM_BLOCKS` | `src/watermark.py` | More blocks = stronger watermark but longer processing region. 256 ≈ 12 s at 44.1 kHz. |
 | `FREQ_LOW/HIGH` | `src/watermark.py` | Mid-frequency band. Avoid going below 100 (speech fundamentals) or above 600 (MP3 strips high freq at low bitrates). |
 

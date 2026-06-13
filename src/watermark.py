@@ -10,7 +10,20 @@ NUM_BLOCKS = 256
 FREQ_LOW = 150
 FREQ_HIGH = 500
 REPETITIONS = 8
-ALPHA = 0.025
+USER_ID_BITS = 32
+
+# Embedding strength is now PERCEPTUAL: the watermark amplitude in each block is
+# ALPHA times that block's own energy in the embedding band. Because the mark is
+# a fixed fraction of whatever signal is already there, it stays masked
+# (inaudible) in loud passages and fades out in quiet ones — instead of being
+# added at a fixed absolute level that stands out as audible "graining" during
+# the near-silent intro common to audiobooks.
+ALPHA = 0.15
+# Floor on the per-block band energy so a near-silent block still carries a
+# faint, detectable mark. ~30x quieter than the old fixed scheme, so any residual
+# noise in true silence is effectively inaudible while detection degrades
+# gracefully rather than dropping the block entirely.
+SILENCE_FLOOR = 0.001
 
 _BAND_WIDTH = FREQ_HIGH - FREQ_LOW  # 350
 _REQUIRED = BLOCK_SIZE * NUM_BLOCKS
@@ -24,8 +37,11 @@ _PN_MATRIX = np.stack(
      for b in range(NUM_BLOCKS)]
 )
 
-# Which payload bit each block carries: blocks [0..7]→bit 0, [8..15]→bit 1, …
-_BLOCK_TO_BIT = np.arange(NUM_BLOCKS) // REPETITIONS
+# Which payload bit each block carries. INTERLEAVED: block i holds bit
+# (i % USER_ID_BITS), so each bit's REPETITIONS copies are spread evenly across
+# the whole 12 s window (every ~1.5 s) rather than clustered into one contiguous
+# stretch. A brief quiet intro therefore can't knock out the low-numbered bits.
+_BLOCK_TO_BIT = np.arange(NUM_BLOCKS) % USER_ID_BITS
 
 
 def _load_mono_float(path: str) -> tuple[np.ndarray, int]:
@@ -69,7 +85,15 @@ def embed_watermark(input_path: str, user_id: int, output_path: str | None = Non
     # single batched DCT over axis=1 instead of 256 separate calls.
     blocks = out[:_REQUIRED].reshape(NUM_BLOCKS, BLOCK_SIZE)
     coeffs = dct(blocks, type=2, norm="ortho", axis=1)
-    coeffs[:, FREQ_LOW:FREQ_HIGH] += ALPHA * bit_per_block[:, None] * _PN_MATRIX
+
+    # Per-block RMS of the host's existing energy in the embedding band, floored
+    # so silence still carries a faint mark. The watermark is scaled by this so
+    # it is always a fixed fraction of the local signal (masked → inaudible).
+    band = coeffs[:, FREQ_LOW:FREQ_HIGH]
+    local_gain = np.maximum(np.sqrt(np.mean(band ** 2, axis=1)), SILENCE_FLOOR)
+    coeffs[:, FREQ_LOW:FREQ_HIGH] += (
+        ALPHA * bit_per_block[:, None] * local_gain[:, None] * _PN_MATRIX
+    )
     out[:_REQUIRED] = idct(coeffs, type=2, norm="ortho", axis=1).reshape(-1)
 
     out = np.clip(out, -1.0, 1.0)
@@ -96,8 +120,11 @@ def detect_watermark(input_path: str) -> int:
     coeffs = dct(blocks, type=2, norm="ortho", axis=1)
     correlations = (coeffs[:, FREQ_LOW:FREQ_HIGH] * _PN_MATRIX).sum(axis=1) / _BAND_WIDTH
 
-    # Majority vote: sum the REPETITIONS correlations per bit, take the sign.
-    votes = correlations.reshape(32, REPETITIONS).sum(axis=1)
+    # Sum each bit's REPETITIONS correlations, then take the sign. Blocks are
+    # interleaved (block i holds bit i % USER_ID_BITS), so reshaping to
+    # (REPETITIONS, USER_ID_BITS) puts all copies of bit c in column c. Louder
+    # blocks naturally contribute larger correlations, weighting reliable blocks.
+    votes = correlations.reshape(REPETITIONS, USER_ID_BITS).sum(axis=0)
     recovered = (votes >= 0).astype(int)
 
     return sum(int(b) << i for i, b in enumerate(recovered))
