@@ -37,6 +37,29 @@ Resources:
             Prefix: temp/
             ExpirationInDays: 2
 
+  # ----- Presigner IAM user ---------------------------------------------------
+  # Lambda execution-role credentials are STS temporary (ASIA...) and expire in
+  # ≤12 h. A presigned URL signed with them becomes invalid after that — even
+  # though the URL's own Expires is 48 h. This dedicated IAM user has permanent
+  # credentials (AKIA...) so presigned URLs remain valid for their full lifetime.
+  # Permissions are scoped to s3:GetObject on temp/ only (read-only, one prefix).
+  PresignerUser:
+    Type: AWS::IAM::User
+    Properties:
+      Policies:
+        - PolicyName: S3GetObjectTempOnly
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "arn:aws:s3:::${AudioBucket}/temp/*"
+
+  PresignerAccessKey:
+    Type: AWS::IAM::AccessKey
+    Properties:
+      UserName: !Ref PresignerUser
+
   # ----- Email --------------------------------------------------------------
   SenderIdentity:
     Type: AWS::SES::EmailIdentity
@@ -56,6 +79,8 @@ Resources:
         Variables:
           BUCKET_NAME: !Ref AudioBucket
           SES_FROM_EMAIL: !Ref SesFromEmail
+          PRESIGNER_KEY_ID: !Ref PresignerAccessKey
+          PRESIGNER_SECRET: !GetAtt PresignerAccessKey.SecretAccessKey
       Policies:
         # Read masters + write watermarked outputs, scoped to this bucket only.
         - S3CrudPolicy:
