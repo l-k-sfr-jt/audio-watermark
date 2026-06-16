@@ -12,8 +12,9 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 _PRODUCT_ID_RE = re.compile(r"^[A-Za-z0-9_\-]+$")
-# master_key must be a safe relative S3 path: no leading slash, no '..' segments.
-_KEY_RE = re.compile(r"^[A-Za-z0-9_\-][A-Za-z0-9_./ \-]*$")
+_AUDIO_CONTENT_TYPES = {"audio/wav", "audio/x-wav", "audio/mpeg", "audio/mp3",
+                         "audio/flac", "audio/x-flac", "audio/aiff", "audio/ogg",
+                         "audio/opus", "application/octet-stream"}
 
 
 def _parse_body(event: dict) -> dict:
@@ -62,6 +63,10 @@ def route_upload_url(event: dict) -> dict:
         return _error(400, "product_id must be non-empty alphanumeric/hyphen/underscore")
     if not filename:
         return _error(400, "filename is required")
+    # Reject non-audio content types to prevent the bucket from being used as
+    # a general-purpose file store via presigned PUTs.
+    if content_type.split(";")[0].strip().lower() not in _AUDIO_CONTENT_TYPES:
+        return _error(400, f"content_type must be an audio MIME type, got: {content_type}")
 
     safe_name = _safe_filename(filename)
     s3_key = f"masters/{product_id}/{safe_name}"
@@ -91,11 +96,14 @@ def route_watermark(event: dict) -> dict:
     master_key = str(body.get("master_key", "")).strip()
     order_id_raw = body.get("order_id")
 
-    # Validate master_key
+    # Validate master_key — must be a masters/ path so callers cannot read
+    # arbitrary keys (e.g. orders/ buyer copies) from the same bucket.
     if not master_key:
         return _error(400, "master_key is required")
-    if master_key.startswith("/") or ".." in master_key.split("/"):
-        return _error(400, "master_key must be a relative path with no '..' segments")
+    if not master_key.startswith("masters/"):
+        return _error(400, "master_key must start with 'masters/'")
+    if ".." in master_key.split("/"):
+        return _error(400, "master_key must not contain '..' path segments")
 
     # Validate order_id — must be a positive integer ≤ 2^32-1 (WooCommerce order ID
     # also serves as the embedded 32-bit watermark code).
