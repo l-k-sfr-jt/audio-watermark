@@ -7,8 +7,10 @@
  * audiobook watermarking enabled, and—if so—calls the watermark service to
  * embed the buyer's order ID into the audio master.
  *
- * On success the watermark code and the master S3 key are stored as order
- * meta so the download handler can later retrieve a fresh presigned URL.
+ * On success the master S3 key is stored in ORDER ITEM meta (not order meta)
+ * so that orders containing multiple watermarked products each track their
+ * own master key independently. A single order-level _watermark_code flag
+ * signals that at least one item has been watermarked.
  *
  * Service call failures are deliberately non-fatal: they are logged with
  * error_log() but do not block order completion or throw exceptions.
@@ -36,7 +38,9 @@ class Audio_WM_Order_Handler {
             return;
         }
 
-        foreach ( $order->get_items() as $item ) {
+        $any_watermarked = false;
+
+        foreach ( $order->get_items() as $item_id => $item ) {
             if ( ! ( $item instanceof WC_Order_Item_Product ) ) {
                 continue;
             }
@@ -56,14 +60,16 @@ class Audio_WM_Order_Handler {
                     'order_id'   => $order_id,
                 ] );
 
-                // Persist so the download handler can refresh the presigned URL later.
-                $order->update_meta_data( '_watermark_code',       $order_id );
-                $order->update_meta_data( '_watermark_master_key', $master_key );
-                $order->save_meta_data();
+                // Store the master key in ITEM meta so each product in the order
+                // can be downloaded independently (order meta would be overwritten
+                // on each iteration if the order contains multiple audio products).
+                wc_update_order_item_meta( $item_id, '_audio_wm_master_key', $master_key );
+                $any_watermarked = true;
 
                 error_log( sprintf(
-                    '[Audio WM] Watermark applied — order #%d, product #%d, code %s, from_cache %s',
+                    '[Audio WM] Watermark applied — order #%d, item #%d, product #%d, code %s, from_cache %s',
                     $order_id,
+                    $item_id,
                     $product_id,
                     $result['watermark_code'] ?? 'n/a',
                     ! empty( $result['from_cache'] ) ? 'true' : 'false'
@@ -72,12 +78,20 @@ class Audio_WM_Order_Handler {
             } catch ( \Exception $e ) {
                 // Log but do NOT abort the order completion flow.
                 error_log( sprintf(
-                    '[Audio WM] Watermark failed — order #%d, product #%d: %s',
+                    '[Audio WM] Watermark failed — order #%d, item #%d, product #%d: %s',
                     $order_id,
+                    $item_id,
                     $product_id,
                     $e->getMessage()
                 ) );
             }
+        }
+
+        // Order-level flag: at least one item was watermarked (used by the
+        // download handler to decide whether to show the download section).
+        if ( $any_watermarked ) {
+            $order->update_meta_data( '_watermark_code', $order_id );
+            $order->save_meta_data();
         }
     }
 
