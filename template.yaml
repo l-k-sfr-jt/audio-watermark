@@ -26,6 +26,8 @@ Resources:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
               SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
       LifecycleConfiguration:
         Rules:
           # Buyer copies are re-created from the master on demand, so there is
@@ -35,6 +37,13 @@ Resources:
             Status: Enabled
             Prefix: orders/
             ExpirationInDays: 30
+          # With versioning enabled, expired current versions become non-current.
+          # Delete those quickly too so old buyer copies don't linger.
+          - Id: PurgeOldBuyerVersions
+            Status: Enabled
+            Prefix: orders/
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 1
 
   # ----- Compute ------------------------------------------------------------
   AudioWatermarkFunction:
