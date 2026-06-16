@@ -15,11 +15,11 @@ def cmd_embed(args: argparse.Namespace) -> None:
 
 
 def cmd_detect(args: argparse.Namespace) -> None:
-    uid = detect_watermark(args.input)
+    uid, confidence = detect_watermark(args.input)
     if uid == -1:
         print("ERROR: audio too short to contain a watermark", file=sys.stderr)
         sys.exit(1)
-    print(f"Detected user_id: {uid}")
+    print(f"Detected user_id: {uid}  (confidence: {confidence:.2f})")
 
 
 def cmd_roundtrip(args: argparse.Namespace) -> None:
@@ -46,7 +46,7 @@ def cmd_roundtrip(args: argparse.Namespace) -> None:
         for bitrate in (64, 128):
             mp3_path = os.path.join(tmp_dir, f"test_{bitrate}k.mp3")
             AudioSegment.from_wav(wm_path).export(mp3_path, format="mp3", bitrate=f"{bitrate}k")
-            detected = detect_watermark(mp3_path)
+            detected, _conf = detect_watermark(mp3_path)
             ok = detected == args.user_id
             results.append((bitrate, detected, ok))
             status = "PASS" if ok else "FAIL"

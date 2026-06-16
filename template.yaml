@@ -52,6 +52,7 @@ Resources:
       PackageType: Image
       MemorySize: 1024
       Timeout: 60
+      Tracing: Active        # X-Ray — free tier 100 k traces/month; SAM adds the layer
       Architectures:
         - x86_64        # change to arm64 to run on Graviton (cheaper, faster on Apple Silicon)
       Environment:

@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import tempfile
+import time
 
 from botocore.exceptions import ClientError
 
@@ -39,6 +40,29 @@ def _ok(payload: dict) -> dict:
         "body": json.dumps(payload),
         "headers": {"Content-Type": "application/json"},
     }
+
+
+def _emf(metrics: list[dict], dimensions: dict, values: dict) -> None:
+    """Emit a CloudWatch Embedded Metrics Format record to stdout.
+
+    CloudWatch parses these automatically from Lambda logs at no extra cost —
+    they appear as real metrics (no PutMetricData API calls needed).
+    """
+    record = {
+        "_aws": {
+            "Timestamp": int(time.time() * 1000),
+            "CloudWatchMetrics": [
+                {
+                    "Namespace": "AudioWM",
+                    "Dimensions": [list(dimensions.keys())],
+                    "Metrics": metrics,
+                }
+            ],
+        },
+        **dimensions,
+        **values,
+    }
+    print(json.dumps(record), flush=True)
 
 
 def _safe_filename(name: str) -> str:
@@ -134,7 +158,15 @@ def route_watermark(event: dict) -> dict:
     try:
         if storage.object_exists(bucket, output_key):
             download_url = storage.generate_presigned_url(bucket, output_key)
-            logger.info("Cache hit: order=%s", order_id)
+            logger.info(json.dumps({
+                "event": "cache_hit", "order_id": order_id,
+                "item_id": item_id_raw, "output_key": output_key,
+            }))
+            _emf(
+                [{"Name": "CacheHit", "Unit": "Count"}],
+                {"Service": "audio-watermark"},
+                {"CacheHit": 1},
+            )
             return _ok({"download_url": download_url, "watermark_code": order_id, "from_cache": True})
     except Exception as exc:
         return _error(500, f"S3 head-object failed: {exc}")
@@ -155,10 +187,12 @@ def route_watermark(event: dict) -> dict:
         except Exception as exc:
             return _error(500, f"S3 download failed for '{master_key}': {exc}")
 
+        embed_start = time.monotonic()
         try:
             watermark.embed_watermark(input_path, order_id, wav_path)
         except Exception as exc:
             return _error(500, f"Watermark embedding failed: {exc}")
+        embed_ms = (time.monotonic() - embed_start) * 1000
 
         try:
             watermark.transcode_to_mp3(wav_path, mp3_path)
@@ -175,7 +209,19 @@ def route_watermark(event: dict) -> dict:
         except Exception as exc:
             return _error(500, f"Presigned URL generation failed: {exc}")
 
-    logger.info("Watermark job complete: order=%s master=%s", order_id, master_key)
+    logger.info(json.dumps({
+        "event": "watermark_complete", "order_id": order_id,
+        "item_id": item_id_raw, "master_key": master_key,
+        "embed_ms": round(embed_ms, 1),
+    }))
+    _emf(
+        [
+            {"Name": "EmbedDuration", "Unit": "Milliseconds"},
+            {"Name": "CacheMiss", "Unit": "Count"},
+        ],
+        {"Service": "audio-watermark"},
+        {"EmbedDuration": round(embed_ms, 1), "CacheMiss": 1},
+    )
     return _ok({"download_url": download_url, "watermark_code": order_id, "from_cache": False})
 
 

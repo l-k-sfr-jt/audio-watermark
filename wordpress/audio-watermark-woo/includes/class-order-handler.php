@@ -22,8 +22,13 @@ defined( 'ABSPATH' ) || exit;
 
 class Audio_WM_Order_Handler {
 
+    /** Maximum number of automatic retry attempts per item. */
+    const MAX_RETRIES = 3;
+
     public function __construct() {
         add_action( 'woocommerce_order_status_completed', [ $this, 'process_order' ], 10, 1 );
+        // Action Scheduler hook for deferred retry (ships with WooCommerce ≥ 3.5).
+        add_action( 'audio_wm_retry_watermark', [ $this, 'retry_watermark' ], 10, 4 );
     }
 
     /**
@@ -72,6 +77,16 @@ class Audio_WM_Order_Handler {
                 $item->save();
                 $any_watermarked = true;
 
+                $cache_label = ! empty( $result['from_cache'] ) ? ' (from cache)' : '';
+                $order->add_order_note( sprintf(
+                    /* translators: 1: item ID, 2: product ID, 3: watermark code, 4: cache label */
+                    __( '[Audio WM] Audiobook watermarked — item #%1$d (product #%2$d), code %3$s%4$s', 'audio-watermark-woo' ),
+                    $item_id,
+                    $product_id,
+                    $result['watermark_code'] ?? 'n/a',
+                    $cache_label
+                ) );
+
                 error_log( sprintf(
                     '[Audio WM] Watermark applied — order #%d, item #%d, product #%d, code %s, from_cache %s',
                     $order_id,
@@ -83,13 +98,34 @@ class Audio_WM_Order_Handler {
 
             } catch ( \Exception $e ) {
                 // Log but do NOT abort the order completion flow.
+                $err = $e->getMessage();
                 error_log( sprintf(
                     '[Audio WM] Watermark failed — order #%d, item #%d, product #%d: %s',
-                    $order_id,
-                    $item_id,
-                    $product_id,
-                    $e->getMessage()
+                    $order_id, $item_id, $product_id, $err
                 ) );
+
+                // Schedule an automatic retry via Action Scheduler (bundled with WooCommerce ≥ 3.5).
+                // Retry attempt 1 at +5 min, attempt 2 at +30 min, attempt 3 at +2 h.
+                if ( function_exists( 'as_schedule_single_action' ) ) {
+                    $delays = [ 300, 1800, 7200 ];
+                    $attempt = 1;
+                    $order->add_order_note( sprintf(
+                        /* translators: 1: item ID, 2: error, 3: delay in minutes */
+                        __( '[Audio WM] Watermarking failed for item #%1$d: %2$s. Retry #%3$d scheduled in %4$d min.', 'audio-watermark-woo' ),
+                        $item_id, $err, $attempt, (int) ( $delays[0] / 60 )
+                    ) );
+                    as_schedule_single_action(
+                        time() + $delays[0],
+                        'audio_wm_retry_watermark',
+                        [ $order_id, $item_id, $master_key, $attempt ]
+                    );
+                } else {
+                    $order->add_order_note( sprintf(
+                        /* translators: 1: item ID, 2: error */
+                        __( '[Audio WM] Watermarking failed for item #%1$d: %2$s. Please retry manually.', 'audio-watermark-woo' ),
+                        $item_id, $err
+                    ) );
+                }
             }
         }
 
@@ -98,6 +134,88 @@ class Audio_WM_Order_Handler {
         if ( $any_watermarked ) {
             $order->update_meta_data( '_watermark_code', $order_id );
             $order->save_meta_data();
+        }
+    }
+
+    /**
+     * Action Scheduler callback: retry a failed watermark job.
+     *
+     * Scheduled with three slots (attempts 1-3) at 5 min / 30 min / 2 h delays.
+     * On success it adds an order note. On final failure it notes that manual
+     * intervention is needed and stops scheduling.
+     *
+     * @param int    $order_id   WooCommerce order ID.
+     * @param int    $item_id    WooCommerce order-item ID.
+     * @param string $master_key S3 key of the audio master.
+     * @param int    $attempt    Which retry this is (1-indexed).
+     */
+    public function retry_watermark( int $order_id, int $item_id, string $master_key, int $attempt ): void {
+        $order = wc_get_order( $order_id );
+        if ( ! $order ) {
+            error_log( "[Audio WM] retry_watermark: could not load order #{$order_id}" );
+            return;
+        }
+
+        try {
+            $result = $this->call_service( '/watermark', [
+                'master_key' => $master_key,
+                'order_id'   => $order_id,
+                'item_id'    => $item_id,
+            ] );
+
+            // On success: store master key in item meta (same as the initial flow).
+            $item = $order->get_item( $item_id );
+            if ( $item instanceof WC_Order_Item_Product ) {
+                $item->update_meta_data( '_audio_wm_master_key', $master_key );
+                $item->save();
+            }
+
+            // Ensure the order-level flag is set so download buttons appear.
+            if ( ! $order->get_meta( '_watermark_code' ) ) {
+                $order->update_meta_data( '_watermark_code', $order_id );
+                $order->save_meta_data();
+            }
+
+            $order->add_order_note( sprintf(
+                /* translators: 1: retry attempt number, 2: item ID, 3: watermark code */
+                __( '[Audio WM] Retry #%1$d succeeded — item #%2$d watermarked (code %3$s).', 'audio-watermark-woo' ),
+                $attempt, $item_id, $result['watermark_code'] ?? 'n/a'
+            ) );
+
+            error_log( sprintf(
+                '[Audio WM] Retry #%d succeeded — order #%d, item #%d',
+                $attempt, $order_id, $item_id
+            ) );
+
+        } catch ( \Exception $e ) {
+            $err     = $e->getMessage();
+            $delays  = [ 300, 1800, 7200 ];
+            $next    = $attempt + 1;
+
+            error_log( sprintf(
+                '[Audio WM] Retry #%d failed — order #%d, item #%d: %s',
+                $attempt, $order_id, $item_id, $err
+            ) );
+
+            if ( $next <= self::MAX_RETRIES && function_exists( 'as_schedule_single_action' ) ) {
+                $delay = $delays[ $attempt ] ?? 7200;
+                $order->add_order_note( sprintf(
+                    /* translators: 1: attempt, 2: item ID, 3: error, 4: next attempt, 5: delay minutes */
+                    __( '[Audio WM] Retry #%1$d failed for item #%2$d: %3$s. Retry #%4$d scheduled in %5$d min.', 'audio-watermark-woo' ),
+                    $attempt, $item_id, $err, $next, (int) ( $delay / 60 )
+                ) );
+                as_schedule_single_action(
+                    time() + $delay,
+                    'audio_wm_retry_watermark',
+                    [ $order_id, $item_id, $master_key, $next ]
+                );
+            } else {
+                $order->add_order_note( sprintf(
+                    /* translators: 1: attempt, 2: item ID, 3: error */
+                    __( '[Audio WM] All %1$d retry attempts failed for item #%2$d: %3$s. Manual action required.', 'audio-watermark-woo' ),
+                    $attempt, $item_id, $err
+                ) );
+            }
         }
     }
 

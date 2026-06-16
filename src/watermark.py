@@ -213,12 +213,17 @@ def embed_watermark(input_path: str, user_id: int, output_path: str | None = Non
     return output_path
 
 
-def detect_watermark(input_path: str) -> int:
-    """Detect and return the embedded user_id, or -1 if signal is too short."""
+def detect_watermark(input_path: str) -> tuple[int, float]:
+    """Detect the embedded user_id.
+
+    Returns ``(user_id, confidence)`` where confidence is a 0-1 score.
+    1.0 means every bit voted unanimously; values above ~0.1 are reliable.
+    Returns ``(-1, 0.0)`` when the signal is too short.
+    """
     samples, _, _ = _load_head(input_path, _REQUIRED)
 
     if len(samples) < _REQUIRED:
-        return -1
+        return -1, 0.0
 
     # Batched DCT over all blocks, then correlate each block's embedding band
     # against its PN sequence. WHITEN first: divide each coefficient by the same
@@ -240,4 +245,12 @@ def detect_watermark(input_path: str) -> int:
     votes = correlations.reshape(REPETITIONS, USER_ID_BITS).sum(axis=0)
     recovered = (votes >= 0).astype(int)
 
-    return sum(int(b) << i for i, b in enumerate(recovered))
+    # Confidence: weakest-bit margin relative to the strongest. Near 1.0 means
+    # every bit had a clear vote; near 0.0 means at least one bit was a
+    # near-toss-up. No extra compute — votes were already computed above.
+    abs_votes = np.abs(votes)
+    max_v = float(abs_votes.max())
+    confidence = float(abs_votes.min()) / max_v if max_v > 0 else 0.0
+
+    code = sum(int(b) << i for i, b in enumerate(recovered))
+    return code, confidence

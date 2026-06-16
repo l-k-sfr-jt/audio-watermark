@@ -29,7 +29,9 @@ def test_embed_detect_roundtrip(tmp_path):
 
     wm_path = embed_watermark(wav_in, 12345)
     assert Path(wm_path).exists()
-    assert detect_watermark(wm_path) == 12345
+    code, confidence = detect_watermark(wm_path)
+    assert code == 12345
+    assert 0.0 <= confidence <= 1.0
 
 
 def test_different_user_ids(tmp_path):
@@ -38,7 +40,8 @@ def test_different_user_ids(tmp_path):
 
     for uid in [0, 1, 2**32 - 1, 99999, 4582]:
         wm_path = embed_watermark(wav_in, uid, str(tmp_path / f"wm_{uid}.wav"))
-        assert detect_watermark(wm_path) == uid, f"Failed for user_id={uid}"
+        code, _conf = detect_watermark(wm_path)
+        assert code == uid, f"Failed for user_id={uid}"
 
 
 def test_output_is_wav(tmp_path):
@@ -56,7 +59,8 @@ def test_short_audio_padded(tmp_path):
     wav_in = str(tmp_path / "short.wav")
     sf.write(wav_in, short, SAMPLE_RATE, subtype="PCM_16")
     wm_path = embed_watermark(wav_in, 7)
-    assert detect_watermark(wm_path) == 7
+    code, _conf = detect_watermark(wm_path)
+    assert code == 7
 
 
 # ---------------------------------------------------------------------------
@@ -75,7 +79,7 @@ def test_mp3_64kbps_roundtrip(tmp_path):
     mp3_path = str(tmp_path / "test_64k.mp3")
     AudioSegment.from_wav(wm_path).export(mp3_path, format="mp3", bitrate="64k")
 
-    detected = detect_watermark(mp3_path)
+    detected, _conf = detect_watermark(mp3_path)
     assert detected == 12345, f"MP3 64kbps roundtrip failed: detected {detected}, expected 12345"
 
 
@@ -91,5 +95,5 @@ def test_mp3_128kbps_roundtrip(tmp_path):
     mp3_path = str(tmp_path / "test_128k.mp3")
     AudioSegment.from_wav(wm_path).export(mp3_path, format="mp3", bitrate="128k")
 
-    detected = detect_watermark(mp3_path)
+    detected, _conf = detect_watermark(mp3_path)
     assert detected == 99999, f"MP3 128kbps roundtrip failed: detected {detected}, expected 99999"
