@@ -85,15 +85,15 @@ sequenceDiagram
     participant S3
 
     WC->>OH: order_id
-    loop each line item
+    loop each line item (item_id)
         OH->>OH: product enabled? has master key?
-        OH->>API: POST {master_key, order_id} (x-api-key)
-        alt orders/<order_id>.mp3 exists
+        OH->>API: POST {master_key, order_id, item_id} (x-api-key)
+        alt orders/<order_id>/<item_id>.mp3 exists
             API-->>OH: { download_url, from_cache:true }
         else
             API->>S3: download master
             API->>WM: embed order_id → MP3 128k
-            API->>S3: put orders/<order_id>.mp3
+            API->>S3: put orders/<order_id>/<item_id>.mp3
             API-->>OH: { download_url, watermark_code, from_cache:false }
         end
         OH->>OH: $item->update_meta_data('_audio_wm_master_key', master_key); $item->save()
@@ -101,12 +101,12 @@ sequenceDiagram
     OH->>OH: if any watermarked → order._watermark_code = order_id
 ```
 
-**Post:** `orders/<order_id>.mp3` exists; each watermarked item has
-`_audio_wm_master_key`; order has `_watermark_code`. **Errors:** a failed
-service call is logged (`error_log`) and **does not block order completion**;
-that item simply gets no item meta and no download button (see Gap G2).
-
-> ⚠️ **Multi-item orders are not handled correctly here — see Gap G1.**
+**Post:** one copy per watermarked item at `orders/<order_id>/<item_id>.mp3`;
+each watermarked item has `_audio_wm_master_key`; order has `_watermark_code`.
+Each item is keyed by its own `item_id`, so different titles in the same order
+never collide (see G1, resolved). **Errors:** a failed service call is logged
+(`error_log`) and **does not block order completion**; that item simply gets no
+item meta and no download button (see Gap G2).
 
 ---
 
@@ -127,8 +127,8 @@ sequenceDiagram
     Page->>Page: add_download_buttons() renders 1 button per watermarked item
     Buyer->>DH: click "Download: <product>" (order_id, item_id, nonce)
     DH->>DH: nonce + ownership + $order->get_item(item_id) → master_key
-    DH->>API: POST {master_key, order_id} (idempotent)
-    API-->>DH: { download_url } (fresh presigned GET, 1h)
+    DH->>API: POST {master_key, order_id, item_id} (idempotent)
+    API-->>DH: { download_url } (fresh presigned GET, 1h) for orders/<order_id>/<item_id>.mp3
     DH->>DH: validate host endsWith .amazonaws.com && https
     DH-->>Buyer: 302 → presigned GET
     Buyer->>S3: GET file
@@ -181,23 +181,21 @@ order ID; look it up to identify the buyer.
 These are real, verified against the code — listed so we can decide what to
 implement before production.
 
-### G1 — 🔴 Multi-item orders serve the wrong file (correctness bug)
-`route_watermark` keys the output at **`orders/<order_id>.mp3`** — on `order_id`
-alone (`src/handler.py:116`). But `process_order` loops **every** eligible item
-calling `/watermark` with the same `order_id` and a different `master_key`
-(`class-order-handler.php:43-67`). The first item creates `orders/<order_id>.mp3`;
-every later item hits the idempotency fast path (`object_exists`) and is served
-**the first product's audio**. At download time UC-4 has the same collision:
-clicking "Download: Product B" returns Product A's file.
+### G1 — ✅ RESOLVED — Multi-item orders served the wrong file
+*Was:* `route_watermark` keyed the output at `orders/<order_id>.mp3` on
+`order_id` alone, while `process_order` looped every eligible item with the same
+`order_id`. The first item created the file; later items hit the idempotency
+fast path and were served the first product's audio (both at order time and at
+download).
 
-*Impact:* any order containing **two or more** watermark-enabled products
-delivers the wrong audio for all but the first. Single-item orders are fine.
-
-*Fix options (needs a decision):*
-- **(a)** Key per item: `orders/<order_id>/<item_id>.mp3` (or `<product_id>`),
-  and pass that scope through `/watermark`. Cleanest; buyers get correct files.
-- **(b)** Embed a per-item code instead of the bare `order_id` and key on it —
-  also improves forensic granularity (G4) but changes the 32-bit code scheme.
+*Fix (option a):* `/watermark` now accepts an optional `item_id` and keys the
+copy at **`orders/<order_id>/<item_id>.mp3`** (`src/handler.py`). The order
+handler and download handler both send the line item's `item_id`
+(`class-order-handler.php`, `class-download-handler.php`), so each title gets its
+own copy and downloads resolve correctly. The embedded code stays `order_id`, so
+forensic tracing is unchanged (G4 still applies). Omitting `item_id` falls back to
+the order-level key for single-item / web-console use. Verified: two items in one
+order produce distinct keys; `item_id` ≤ 0 is rejected with `400`.
 
 ### G2 — Failed watermarking at completion is silent to staff
 If the service call in UC-3 fails, it is only `error_log`-ged; the order
@@ -216,8 +214,10 @@ WooCommerce order note and/or an admin-visible retry.
 ### G4 — Forensic granularity is per-order, not per-title
 The embedded code is the order ID, so two leaked files from the same multi-item
 order both decode to the same number. You learn the buyer, not which purchased
-title leaked (though the audio content itself usually makes that obvious).
-Fixing G1 via option (b) would also resolve this.
+title leaked (though the audio content itself usually makes that obvious). The
+G1 fix deliberately kept the code = order_id (it only namespaces *storage* by
+item); embedding a per-item code instead would also resolve this but changes the
+32-bit code scheme and forensic lookup, so it was left out of scope.
 
 ### G5 — Watermark only in the first ~12 s (trim-vulnerable)
 By design (memory-bounded embed), the mark lives in the opening ~12 s. Trimming
@@ -246,8 +246,8 @@ plugin are current; these two guides need rewriting.
 | Configure service (UC-1) | ✅ implemented |
 | Upload master (UC-2) | ✅ implemented (minor orphan-on-no-save note) |
 | Watermark on completion — single-item order (UC-3) | ✅ implemented |
-| Watermark on completion — multi-item order | 🔴 **G1 bug** |
-| Buyer download (UC-4) | ✅ implemented (single-item) |
+| Watermark on completion — multi-item order | ✅ fixed (per-item key, was G1) |
+| Buyer download (UC-4) | ✅ implemented (per item) |
 | Re-download after expiry (UC-5) | ✅ implemented |
 | Forensic trace (UC-6) | ✅ implemented (per-order granularity, G4) |
 | Failure visibility to staff (G2) | ❌ not implemented |

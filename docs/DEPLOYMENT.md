@@ -147,9 +147,6 @@ audio**, save. Place a test order, mark it **completed**, and confirm a
   the key resource and redeploy) and update the WooCommerce setting.
 - **arm64 Lambda:** set `Architectures: [arm64]` in `template.yaml` and the arm64
   ffmpeg build in `Dockerfile` for ~20% cheaper/faster execution.
-- **Multi-item orders:** before selling orders that contain two or more
-  watermark-enabled audiobooks, address the per-item output-key limitation noted
-  in [USE-CASES.md](USE-CASES.md) (Known limitations → G1).
 
 ## Tearing it all down
 

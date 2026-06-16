@@ -188,9 +188,13 @@ class Audio_WM_Download_Handler {
 
         // ── Call watermark service (idempotent — returns a fresh presigned URL) ──
         try {
+            // Send the same item_id the order handler used so this resolves to
+            // the per-item copy (orders/<order_id>/<item_id>.mp3), not whichever
+            // title happened to be watermarked first in a multi-item order.
             $result = Audio_WM_Order_Handler::call_service( '/watermark', [
                 'master_key' => $master_key,
                 'order_id'   => $order_id,
+                'item_id'    => $item_id,
             ] );
         } catch ( \Exception $e ) {
             error_log( "[Audio WM] Download failed — order #{$order_id}, item #{$item_id}: " . $e->getMessage() );

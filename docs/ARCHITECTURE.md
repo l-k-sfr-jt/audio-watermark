@@ -87,7 +87,7 @@ Validation (`route_upload_url`):
 ### `POST /watermark` (idempotent)
 Request:
 ```json
-{ "master_key": "masters/123/audiobook.wav", "order_id": 456789 }
+{ "master_key": "masters/123/audiobook.wav", "order_id": 456789, "item_id": 7 }
 ```
 Response:
 ```json
@@ -97,14 +97,26 @@ Response:
 Validation (`route_watermark`):
 - `master_key` required, **must start with `masters/`**, must not contain `..` segments.
 - `order_id` must be an integer `1 … 2^32-1` (also the embedded 32-bit code).
+- `item_id` **optional**; if present must be a positive integer (WooCommerce
+  order-item ID). It only namespaces the stored copy — it is **not** part of the
+  embedded code.
 - Presigned GET expiry: **3600 s (1 h)**, signed with the Lambda execution role.
 
+Output key:
+- With `item_id` → `orders/<order_id>/<item_id>.mp3` (so two different titles in
+  one order never collide).
+- Without `item_id` → `orders/<order_id>.mp3` (single-item / web-console path).
+
 Behaviour:
-- **Fast path** — if `orders/<order_id>.mp3` already exists (`object_exists`),
-  return a fresh presigned GET with `from_cache: true`. No re-embedding.
+- **Fast path** — if the target copy already exists (`object_exists`), return a
+  fresh presigned GET with `from_cache: true`. No re-embedding.
 - **Slow path** — download master → `embed_watermark(order_id)` →
-  `transcode_to_mp3` (128 kbps) → upload to `orders/<order_id>.mp3` → presign,
+  `transcode_to_mp3` (128 kbps) → upload to the output key → presign,
   `from_cache: false`.
+
+> The embedded watermark code is always `order_id`, independent of `item_id`, so
+> forensic tracing remains per-order (the buyer). Per-item keying only fixes
+> *delivery* so each title is served correctly.
 
 ---
 
@@ -114,7 +126,8 @@ Behaviour:
 | Prefix | Content | Lifecycle |
 |--------|---------|-----------|
 | `masters/<product_id>/<filename>` | Product master | Permanent (no rule) |
-| `orders/<order_id>.mp3` | Buyer copy | 30-day expiry; non-current versions purged after 1 day |
+| `orders/<order_id>/<item_id>.mp3` | Buyer copy, per line item (sent by the plugin) | 30-day expiry; non-current versions purged after 1 day |
+| `orders/<order_id>.mp3` | Buyer copy when no `item_id` is sent (single-item / web console) | 30-day expiry |
 
 Bucket hardening: all public access blocked, SSE-AES256 default encryption,
 versioning enabled.

@@ -82,20 +82,30 @@ The upload_url is a presigned S3 PUT valid for 15 min. The browser/client PUTs
 the file directly to S3 — no AWS keys in WordPress.
 
 ### POST /watermark (idempotent)
-Request: `{ "master_key": "masters/123/audiobook.wav", "order_id": 456789 }`
+Request: `{ "master_key": "masters/123/audiobook.wav", "order_id": 456789, "item_id": 7 }`
 Response: `{ "download_url": "https://s3.amazonaws.com/presigned-get...", "watermark_code": 456789, "from_cache": false }`
 
 `order_id` (numeric WooCommerce order ID) is embedded as the 32-bit watermark
-code. If `orders/<order_id>.mp3` already exists in S3, the call just presigns it
+code. `item_id` (optional, a WooCommerce order-item ID) namespaces the stored
+copy so that multiple different audiobooks in one order don't collide on a single
+key: with it the copy is `orders/<order_id>/<item_id>.mp3`, without it it falls
+back to `orders/<order_id>.mp3` (single-item / web-console path). The embedded
+code is always `order_id` regardless of `item_id`, so forensic tracing is
+per-order. If the target copy already exists in S3 the call just presigns it
 (fast path, `from_cache: true`). After the 30-day S3 lifecycle expiry the slow
 path (re-watermark from master) runs automatically on the next request.
+
+The WooCommerce order handler and download handler always send the **same**
+`item_id`, so a buyer's "Download" click resolves to exactly the copy made for
+that line item.
 
 ## S3 Key Layout
 
 | Prefix          | Content                  | Lifecycle     |
 |-----------------|--------------------------|---------------|
-| `masters/`      | Product master files     | Permanent     |
-| `orders/`       | Buyer watermarked copies | 30-day expiry |
+| `masters/<product_id>/<file>`      | Product master files     | Permanent     |
+| `orders/<order_id>/<item_id>.mp3`  | Buyer watermarked copies (per line item) | 30-day expiry |
+| `orders/<order_id>.mp3`            | Buyer copy when no item_id is sent (single-item / web console) | 30-day expiry |
 
 ## Environment Variables (Lambda)
 
@@ -122,7 +132,9 @@ Admin product panel:
 - Upload flow: AJAX → /products/upload-url → browser PUT to presigned URL → save s3_key to product meta
 
 Order processing (woocommerce_order_status_completed):
-- POST /watermark { master_key, order_id }; save _watermark_code to order meta
+- For each watermark-enabled line item: POST /watermark { master_key, order_id, item_id };
+  save the master key to that item's meta (_audio_wm_master_key) and set
+  _watermark_code on the order
 
 Customer download (My Account):
 - "Download Audiobook" link → AJAX endpoint → POST /watermark (idempotent, fresh URL) → 302 redirect

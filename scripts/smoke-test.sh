@@ -6,17 +6,18 @@
 #   4. Re-call /watermark (idempotency check — must return from_cache: true)
 #   5. Verify API key enforcement
 #
-# Usage:  ./scripts/smoke-test.sh <local-audio-file> <order-id>
-# Example: ./scripts/smoke-test.sh sample.wav 9001
+# Usage:  ./scripts/smoke-test.sh <local-audio-file> [order-id] [item-id]
+# Example: ./scripts/smoke-test.sh sample.wav 9001 1
 set -euo pipefail
 
 AUDIO="${1:-}"
 ORDER_ID="${2:-9001}"
+ITEM_ID="${3:-1}"   # exercises the per-item key path: orders/<order_id>/<item_id>.mp3
 REGION="${AWS_REGION:-eu-central-1}"
 STACK="${STACK_NAME:-audio-watermark}"
 
 if [[ -z "$AUDIO" ]]; then
-  echo "Usage: $0 <local-audio-file> [order-id]" >&2
+  echo "Usage: $0 <local-audio-file> [order-id] [item-id]" >&2
   exit 1
 fi
 if [[ ! -f "$AUDIO" ]]; then
@@ -66,7 +67,7 @@ echo "==> Step 3: POST /watermark (first call — slow path)"
 WM_RESP=$(curl -s -X POST "$API_BASE/watermark" \
   -H "Content-Type: application/json" \
   -H "x-api-key: $API_KEY" \
-  -d "{\"master_key\":\"$S3_KEY\",\"order_id\":$ORDER_ID}")
+  -d "{\"master_key\":\"$S3_KEY\",\"order_id\":$ORDER_ID,\"item_id\":$ITEM_ID}")
 echo "    response: $WM_RESP"
 
 DOWNLOAD_URL=$(echo "$WM_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['download_url'])")
@@ -96,7 +97,7 @@ echo "==> Step 5: POST /watermark again (idempotency — should return from_cach
 WM_RESP2=$(curl -s -X POST "$API_BASE/watermark" \
   -H "Content-Type: application/json" \
   -H "x-api-key: $API_KEY" \
-  -d "{\"master_key\":\"$S3_KEY\",\"order_id\":$ORDER_ID}")
+  -d "{\"master_key\":\"$S3_KEY\",\"order_id\":$ORDER_ID,\"item_id\":$ITEM_ID}")
 FROM_CACHE2=$(echo "$WM_RESP2" | python3 -c "import sys,json; print(json.load(sys.stdin)['from_cache'])")
 if [[ "$FROM_CACHE2" == "True" ]]; then
   echo "  [PASS] Second call: from_cache=true (served from existing file)"

@@ -95,6 +95,7 @@ def route_watermark(event: dict) -> dict:
     body = _parse_body(event)
     master_key = str(body.get("master_key", "")).strip()
     order_id_raw = body.get("order_id")
+    item_id_raw = body.get("item_id")
 
     # Validate master_key — must be a masters/ path so callers cannot read
     # arbitrary keys (e.g. orders/ buyer copies) from the same bucket.
@@ -113,7 +114,21 @@ def route_watermark(event: dict) -> dict:
         return _error(400, "order_id must be a positive 32-bit integer (WooCommerce order ID)")
     order_id: int = order_id_raw
 
-    output_key = f"orders/{order_id}.mp3"
+    # Validate optional item_id — a WooCommerce order-item ID used only to
+    # namespace the stored copy. One order can contain several different
+    # audiobooks; without per-item keys they would all collide on
+    # orders/<order_id>.mp3 and the first title watermarked would be served for
+    # every item. With it, each title gets its own correct copy. The embedded
+    # code stays the order_id, so forensic tracing is unchanged. Omitting
+    # item_id falls back to the order-level key (single-item / web-console path).
+    if item_id_raw is not None:
+        if isinstance(item_id_raw, float) and item_id_raw.is_integer():
+            item_id_raw = int(item_id_raw)
+        if not isinstance(item_id_raw, int) or not (1 <= item_id_raw <= 2**63 - 1):
+            return _error(400, "item_id, if provided, must be a positive integer (WooCommerce order-item ID)")
+        output_key = f"orders/{order_id}/{item_id_raw}.mp3"
+    else:
+        output_key = f"orders/{order_id}.mp3"
 
     # Idempotent fast path: serve an existing buyer copy without re-watermarking.
     try:

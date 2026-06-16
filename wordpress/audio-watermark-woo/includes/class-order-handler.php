@@ -55,9 +55,14 @@ class Audio_WM_Order_Handler {
             }
 
             try {
+                // item_id namespaces the stored copy (orders/<order_id>/<item_id>.mp3)
+                // so multiple different audiobooks in one order don't collide on a
+                // single orders/<order_id>.mp3 key. The download handler sends the
+                // same item_id so it resolves to this exact copy.
                 $result = $this->call_service( '/watermark', [
                     'master_key' => $master_key,
                     'order_id'   => $order_id,
+                    'item_id'    => $item_id,
                 ] );
 
                 // Store the master key in ITEM meta so each product in the order
