@@ -1,22 +1,16 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
-Description: Forensic audio watermarking service — watermarks audiobooks with a buyer user_id
+Description: Forensic audio watermarking service — embeds a buyer order ID into audiobooks
 
-# This template provisions EVERYTHING the service needs so the only manual step
-# left after `sam deploy` is clicking the SES verification link in your inbox:
-#   - S3 bucket (private, with temp/ auto-expiry)
-#   - SES sender identity (email verification)
+# This template provisions everything the service needs so the only step after
+# `sam deploy` is configuring the returned API base URL and key in your plugin:
+#   - S3 bucket (masters/ permanent; orders/ 30-day auto-expiry)
 #   - the watermarking Lambda (container image) with least-privilege IAM
-#   - an API Gateway POST /watermark endpoint
+#   - an API Gateway with two endpoints behind an API key
+#     POST /products/upload-url  — admin uploads a master
+#     POST /watermark            — order processing + re-download (idempotent)
 #
 # Deploy with the helper script:  ./scripts/deploy.sh
-
-Parameters:
-  SesFromEmail:
-    Type: String
-    Description: >
-      Sender email address. SES emails a verification link here on first deploy;
-      until you click it, no mail can be sent from this address.
 
 Resources:
   # ----- Storage ------------------------------------------------------------
@@ -30,41 +24,13 @@ Resources:
         RestrictPublicBuckets: true
       LifecycleConfiguration:
         Rules:
-          # Watermarked outputs are throwaway: the presigned link lasts 48h, so
-          # there is no reason to keep them. Auto-delete after 2 days to control cost.
-          - Id: ExpireTempWatermarks
+          # Buyer copies are re-created from the master on demand, so there is
+          # no reason to keep them forever. Auto-delete after 30 days to control
+          # storage cost while still serving repeat downloaders for a month.
+          - Id: ExpireBuyerCopies
             Status: Enabled
-            Prefix: temp/
-            ExpirationInDays: 2
-
-  # ----- Presigner IAM user ---------------------------------------------------
-  # Lambda execution-role credentials are STS temporary (ASIA...) and expire in
-  # ≤12 h. A presigned URL signed with them becomes invalid after that — even
-  # though the URL's own Expires is 48 h. This dedicated IAM user has permanent
-  # credentials (AKIA...) so presigned URLs remain valid for their full lifetime.
-  # Permissions are scoped to s3:GetObject on temp/ only (read-only, one prefix).
-  PresignerUser:
-    Type: AWS::IAM::User
-    Properties:
-      Policies:
-        - PolicyName: S3GetObjectTempOnly
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Effect: Allow
-                Action: s3:GetObject
-                Resource: !Sub "arn:aws:s3:::${AudioBucket}/temp/*"
-
-  PresignerAccessKey:
-    Type: AWS::IAM::AccessKey
-    Properties:
-      UserName: !Ref PresignerUser
-
-  # ----- Email --------------------------------------------------------------
-  SenderIdentity:
-    Type: AWS::SES::EmailIdentity
-    Properties:
-      EmailIdentity: !Ref SesFromEmail
+            Prefix: orders/
+            ExpirationInDays: 30
 
   # ----- Compute ------------------------------------------------------------
   AudioWatermarkFunction:
@@ -78,29 +44,25 @@ Resources:
       Environment:
         Variables:
           BUCKET_NAME: !Ref AudioBucket
-          SES_FROM_EMAIL: !Ref SesFromEmail
-          PRESIGNER_KEY_ID: !Ref PresignerAccessKey
-          PRESIGNER_SECRET: !GetAtt PresignerAccessKey.SecretAccessKey
       Policies:
-        # Read masters + write watermarked outputs, scoped to this bucket only.
+        # Read masters + write watermarked buyer copies, scoped to this bucket.
         - S3CrudPolicy:
             BucketName: !Ref AudioBucket
-        # Send the download-link email. SES SendEmail does not support
-        # resource-level scoping cleanly, so this is action-scoped.
-        - Statement:
-            - Effect: Allow
-              Action:
-                - ses:SendEmail
-                - ses:SendRawEmail
-              Resource: '*'
       Events:
+        UploadUrlApi:
+          Type: Api
+          Properties:
+            Path: /products/upload-url
+            Method: post
+            Auth:
+              ApiKeyRequired: true
         WatermarkApi:
           Type: Api
           Properties:
             Path: /watermark
             Method: post
             Auth:
-              ApiKeyRequired: true  # enforced on the implicit ServerlessRestApi — avoids replacing Lambda::Permission
+              ApiKeyRequired: true
     Metadata:
       Dockerfile: Dockerfile
       DockerContext: .
@@ -141,6 +103,9 @@ Outputs:
   FunctionName:
     Description: Lambda function name (used by scripts/smoke-test.sh)
     Value: !Ref AudioWatermarkFunction
+  ApiBaseUrl:
+    Description: Base URL for the watermarking API (configure this in the WooCommerce plugin)
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod"
   ApiEndpoint:
     Description: POST endpoint for watermark requests
     Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/watermark"

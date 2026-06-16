@@ -1,29 +1,30 @@
 # CLAUDE.md — audio-watermark-lambda
 
-Forensic audio watermarking service: embeds a unique 32-bit `user_id` into
-audiobook WAV files using DCT spread-spectrum so leaked copies can be traced
-back to the buyer. This phase covers local algorithm development and Lambda
-code only — no AWS deployment yet.
+Forensic audio watermarking service: embeds a unique 32-bit order ID into
+audiobook WAV/MP3 files using DCT spread-spectrum so leaked copies can be traced
+back to the buyer via the WooCommerce order ID.
 
 ## Project Structure
 
 ```
 src/
-  handler.py      # Lambda entry point — orchestrates download → embed → upload → email
-  watermark.py    # Core DCT algorithm: embed_watermark() / detect_watermark()
+  handler.py      # Lambda entry point — routes /products/upload-url and /watermark
+  watermark.py    # Core DCT algorithm: embed_watermark() / detect_watermark() / transcode_to_mp3()
                   #   *** NO boto3/AWS imports allowed here — must stay portable ***
-  storage.py      # S3 download/upload, presigned URL generation (boto3)
-  notify.py       # SES email dispatch (boto3)
+  storage.py      # S3 helpers: download, upload, presign GET/PUT, object_exists (boto3)
 tests/
-  test_watermark.py   # Unit tests: embed/detect roundtrip + MP3 64kbps robustness
+  test_watermark.py   # Unit tests: embed/detect roundtrip + MP3 robustness
   sample_audio/       # Short test .mp3 / .wav fixtures
 cli.py            # Local CLI — runs embed/detect/roundtrip without AWS
 requirements.txt  # numpy, scipy, soundfile, pydub, boto3, pytest
 Dockerfile        # Container-image Lambda — bundles ffmpeg + scientific stack
-template.yaml     # SAM template — provisions S3 + SES + Lambda + API (Phase 3)
+template.yaml     # SAM template — provisions S3 + Lambda + API (no SES)
 samconfig.toml    # SAM deploy defaults (region eu-central-1)
-scripts/          # check-prereqs / deploy / verify-recipient / smoke-test / teardown
+scripts/          # check-prereqs / deploy / smoke-test / teardown
 docs/DEPLOYMENT.md # Zero-to-deployed AWS guide
+web/              # Next.js test console (upload master → watermark → play MP3 → detect)
+wordpress/
+  audio-watermark-woo/   # WooCommerce plugin (Phase 5)
 README.md
 ```
 
@@ -45,12 +46,13 @@ The watermark encodes a 32-bit integer across `NUM_BLOCKS` DCT blocks, each
 whole window (block `i` carries bit `i % 32`), so a quiet intro can't wipe out
 any single bit. Embedding is **perceptual**: a masking envelope is built per
 block by spreading the host's band magnitude across `±SPREAD_BINS` neighbours,
-and the mark is scaled to it (`ALPHA × envelope`). The mark therefore sits loud
-near the tones that mask it and near-silent in the gaps between them — key to
-staying inaudible on tonal/music content. Detection **whitens** (divides each
-coefficient by the same envelope) before correlating, so a few loud host tones
-can't swamp the vote; it then sums each bit's repetition correlations and takes
-the sign. Output of `embed_watermark()` is always WAV (PCM 16-bit).
+and the mark is scaled to it (`ALPHA × envelope`). Detection **whitens** before
+correlating. Output of `embed_watermark()` is always WAV (PCM 16-bit); the
+handler calls `transcode_to_mp3()` to convert the result to MP3 128 kbps.
+
+**Memory-bounded embed**: only the first `_REQUIRED` samples (~12 s at 44.1 kHz)
+are decoded into numpy. For longer files the untouched tail is stitched back via
+ffmpeg concat, so a multi-hour master never loads more than ~4 MB into Python.
 
 ## Development Commands
 
@@ -70,42 +72,59 @@ pytest tests/ -v
 The `roundtrip-test` command and the MP3 robustness unit test both require
 `ffmpeg` on `PATH`. If absent they skip gracefully with a clear message.
 
-## Lambda Event Schema
+## API Endpoints (both behind x-api-key)
 
-```json
-{ "s3_key": "originals/book.mp3", "user_id": 4582,
-  "email": "buyer@example.com", "order_id": "wc_1234" }
-```
+### POST /products/upload-url
+Request: `{ "product_id": "123", "filename": "audiobook.wav", "content_type": "audio/wav" }`
+Response: `{ "upload_url": "https://s3.amazonaws.com/presigned-put...", "s3_key": "masters/123/audiobook.wav" }`
 
-Success response: `{"statusCode": 200, "body": {"status": "ok", "watermark_id": 4582}}`
+The upload_url is a presigned S3 PUT valid for 15 min. The browser/client PUTs
+the file directly to S3 — no AWS keys in WordPress.
 
-Watermarked file is uploaded to `temp/{order_id}_{user_id}.wav`. A presigned
-GET URL (48-hour expiry) is emailed to the buyer via SES.
+### POST /watermark (idempotent)
+Request: `{ "master_key": "masters/123/audiobook.wav", "order_id": 456789 }`
+Response: `{ "download_url": "https://s3.amazonaws.com/presigned-get...", "watermark_code": 456789, "from_cache": false }`
 
-Lambda config: **1024 MB memory, 60 s timeout**.
+`order_id` (numeric WooCommerce order ID) is embedded as the 32-bit watermark
+code. If `orders/<order_id>.mp3` already exists in S3, the call just presigns it
+(fast path, `from_cache: true`). After the 30-day S3 lifecycle expiry the slow
+path (re-watermark from master) runs automatically on the next request.
 
-## Environment Variables (Lambda / local simulation)
+## S3 Key Layout
 
-| Variable          | Description                           |
-|-------------------|---------------------------------------|
-| `BUCKET_NAME`     | S3 bucket for source and output audio |
-| `SES_FROM_EMAIL`  | Verified SES sender address           |
+| Prefix          | Content                  | Lifecycle     |
+|-----------------|--------------------------|---------------|
+| `masters/`      | Product master files     | Permanent     |
+| `orders/`       | Buyer watermarked copies | 30-day expiry |
+
+## Environment Variables (Lambda)
+
+| Variable      | Description                           |
+|---------------|---------------------------------------|
+| `BUCKET_NAME` | S3 bucket for all audio               |
 
 ## Architectural Rules
 
 1. `watermark.py` must never import `boto3` or any AWS SDK — it must run
    identically in Lambda and the local CLI without AWS credentials.
-2. All S3 and SES calls live exclusively in `storage.py` and `notify.py`.
+2. All S3 calls live exclusively in `storage.py`.
 3. The Lambda is packaged as a **container image** (`Dockerfile`), not zip —
-   ffmpeg and scipy are bundled. Deploy via `scripts/deploy.sh`, never by
-   editing live AWS resources by hand.
+   ffmpeg and scipy are bundled. Deploy via `scripts/deploy.sh`.
+4. Presigned GET URLs use the Lambda execution role (1 h expiry). Since buyer
+   copies are re-minted on every download, they are always fresh before the
+   STS session (≤12 h) could expire.
+5. SES is not used — WordPress handles all customer email.
 
-## Current Phase Scope
+## WooCommerce Plugin (wordpress/audio-watermark-woo/)
 
-In scope: local watermark implementation (`watermark.py`, `cli.py`, `tests/`),
-Lambda handler wiring (`handler.py`, `storage.py`, `notify.py`), and Phase 3
-deployment (`Dockerfile`, `template.yaml`, `scripts/`, `docs/DEPLOYMENT.md`).
-The `/watermark` API is intentionally unauthenticated for now.
+Admin product panel:
+- Enable watermarking checkbox + S3 key field + "Upload master" button
+- Upload flow: AJAX → /products/upload-url → browser PUT to presigned URL → save s3_key to product meta
 
-Out of scope until later phases: API authentication/authorizer,
-WordPress/WooCommerce plugin integration.
+Order processing (woocommerce_order_status_completed):
+- POST /watermark { master_key, order_id }; save _watermark_code to order meta
+
+Customer download (My Account):
+- "Download Audiobook" link → AJAX endpoint → POST /watermark (idempotent, fresh URL) → 302 redirect
+
+Forensic lookup: order_id (the watermark code) → look up WooCommerce order → buyer info

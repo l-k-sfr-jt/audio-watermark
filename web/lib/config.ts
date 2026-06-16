@@ -3,11 +3,10 @@
 // fails with one clear message instead of a confusing downstream AWS/SDK error.
 
 export interface AppConfig {
-  apiUrl: string;
+  apiBaseUrl: string;   // e.g. https://xxx.execute-api.eu-central-1.amazonaws.com/Prod
   bucket: string;
   region: string;
   apiKey: string | undefined;
-  notifyEmail: string;
   pythonBin: string;
 }
 
@@ -24,11 +23,10 @@ function required(name: string): string {
 
 export function getConfig(): AppConfig {
   return {
-    apiUrl: required("WATERMARK_API_URL"),
+    apiBaseUrl: required("WATERMARK_API_BASE_URL"),
     bucket: required("WATERMARK_BUCKET"),
     region: process.env.AWS_REGION || "eu-central-1",
     apiKey: process.env.WATERMARK_API_KEY || undefined,
-    notifyEmail: process.env.NOTIFY_EMAIL || "test@example.com",
     pythonBin: process.env.PYTHON_BIN || "python3",
   };
 }

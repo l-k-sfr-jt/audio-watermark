@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import os
+import subprocess
 
 import numpy as np
 import soundfile as sf
-from pydub import AudioSegment
 from scipy.fft import dct, idct
 from scipy.ndimage import maximum_filter1d
 
@@ -68,73 +68,154 @@ def _masking_envelope(band: np.ndarray) -> np.ndarray:
     return np.maximum(spread, SILENCE_FLOOR)
 
 
-def _load_mono_float(path: str) -> tuple[np.ndarray, int]:
-    """Load any audio file as mono float64 in [-1.0, 1.0].
+def _load_head(path: str, max_samples: int) -> tuple[np.ndarray, int, bool]:
+    """Load up to max_samples from the start of audio as mono float64.
 
-    soundfile handles WAV/FLAC/OGG natively.  MP3 (and anything else
-    libsndfile can't read) falls back to pydub/ffmpeg.  Only format errors
-    trigger the fallback — a missing file raises FileNotFoundError immediately
-    so callers see the real cause instead of a confusing decode traceback.
+    Returns (samples, sample_rate, file_is_longer_than_max_samples).
+    Uses soundfile for WAV/FLAC (partial read — only max_samples decoded into
+    memory regardless of total file size) and ffmpeg pipe for MP3/other formats
+    (also bounded: only the needed duration is decoded).
     """
     if not os.path.isfile(path):
         raise FileNotFoundError(f"No such audio file: {path}")
-    try:
-        samples, sr = sf.read(path, always_2d=False, dtype="float64")
-    except sf.SoundFileError:
-        # libsndfile cannot decode this format (e.g. MP3) — try pydub/ffmpeg
-        seg = AudioSegment.from_file(path)
-        seg = seg.set_channels(1)
-        raw = np.array(seg.get_array_of_samples(), dtype=np.float64)
-        samples = raw / (2 ** (seg.sample_width * 8 - 1))
-        sr = seg.frame_rate
-        return samples, sr
 
-    if samples.ndim == 2:
-        samples = samples.mean(axis=1)
-    return samples, sr
+    try:
+        with sf.SoundFile(path) as f:
+            sr = f.samplerate
+            file_is_longer = f.frames > max_samples
+            raw = f.read(frames=min(max_samples, f.frames), dtype="float64", always_2d=True)
+        if raw.shape[1] > 1:
+            raw = raw.mean(axis=1)
+        else:
+            raw = raw[:, 0]
+        return raw.copy(), sr, file_is_longer
+    except sf.SoundFileError:
+        pass  # fall through to ffmpeg for MP3 / unsupported formats
+
+    # Probe for sample rate and duration without decoding the full file.
+    probe = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "a:0",
+            "-show_entries", "stream=sample_rate,duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            path,
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    lines = probe.stdout.strip().split("\n")
+    sr = int(lines[0])
+    try:
+        file_is_longer = float(lines[1]) * sr > max_samples
+    except (IndexError, ValueError):
+        file_is_longer = True  # assume longer if duration unavailable
+
+    head_seconds = max_samples / sr
+    decoded = subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-t", f"{head_seconds:.6f}",
+            "-i", path,
+            "-f", "f64le",
+            "-ac", "1",
+            "-ar", str(sr),
+            "pipe:1",
+        ],
+        capture_output=True,
+        check=True,
+    )
+    samples = np.frombuffer(decoded.stdout, dtype=np.float64).copy()
+    return samples[:max_samples], sr, file_is_longer
+
+
+def _stitch_with_tail(head_wav: str, original: str, skip_seconds: float, sr: int, out_wav: str) -> None:
+    """Append original[skip_seconds:] (converted to mono at sr) after head_wav."""
+    subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-i", head_wav,
+            "-ss", f"{skip_seconds:.6f}",
+            "-i", original,
+            "-filter_complex",
+            (
+                f"[1:a]aresample={sr},"
+                "aformat=sample_fmts=s16:channel_layouts=mono[tail];"
+                "[0:a][tail]concat=n=2:v=0:a=1[out]"
+            ),
+            "-map", "[out]",
+            out_wav,
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+
+def transcode_to_mp3(wav_path: str, mp3_path: str, bitrate: str = "128k") -> str:
+    """Transcode a WAV to mono MP3 at the given bitrate using ffmpeg."""
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", wav_path, "-b:a", bitrate, "-ac", "1", mp3_path],
+            check=True,
+            capture_output=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(f"ffmpeg transcode failed: {exc.stderr.decode()}") from exc
+    return mp3_path
 
 
 def embed_watermark(input_path: str, user_id: int, output_path: str | None = None) -> str:
-    """Embed user_id into the first ~12 s of audio. Returns path to WAV output."""
-    samples, sr = _load_mono_float(input_path)
+    """Embed user_id into the first ~12 s of audio. Returns path to WAV output.
 
-    if len(samples) < _REQUIRED:
-        samples = np.pad(samples, (0, _REQUIRED - len(samples)))
+    Memory-bounded: only _REQUIRED samples (~12 s at 44.1 kHz) are decoded into
+    numpy regardless of total file length. For files longer than ~12 s the
+    untouched tail is stitched back via ffmpeg, so a multi-hour audiobook master
+    never loads more than a few MB into Python.
+    """
+    if output_path is None:
+        base = os.path.splitext(input_path)[0]
+        output_path = base + "_wm.wav"
+
+    head, sr, file_is_longer = _load_head(input_path, _REQUIRED)
+
+    if len(head) < _REQUIRED:
+        head = np.pad(head, (0, _REQUIRED - len(head)))
 
     bits = np.array([(user_id >> i) & 1 for i in range(32)], dtype=np.float64)
     bits = bits * 2 - 1  # map {0,1} → {-1,+1}
     bit_per_block = bits[_BLOCK_TO_BIT]  # (NUM_BLOCKS,)
 
-    out = samples.copy()
-
-    # Reshape the embedding region into (NUM_BLOCKS, BLOCK_SIZE) and run a
-    # single batched DCT over axis=1 instead of 256 separate calls.
-    blocks = out[:_REQUIRED].reshape(NUM_BLOCKS, BLOCK_SIZE)
+    blocks = head.reshape(NUM_BLOCKS, BLOCK_SIZE)
     coeffs = dct(blocks, type=2, norm="ortho", axis=1)
 
-    # Shape the mark by the masking envelope so it sits under the audio's own
-    # spectrum: loud near the tones that hide it, near-silent in the gaps.
     band = coeffs[:, FREQ_LOW:FREQ_HIGH]
     envelope = _masking_envelope(band)
     coeffs[:, FREQ_LOW:FREQ_HIGH] += (
         ALPHA * bit_per_block[:, None] * envelope * _PN_MATRIX
     )
-    out[:_REQUIRED] = idct(coeffs, type=2, norm="ortho", axis=1).reshape(-1)
+    marked_head = idct(coeffs, type=2, norm="ortho", axis=1).reshape(-1)
+    marked_head = np.clip(marked_head, -1.0, 1.0)
+    pcm = (marked_head * 32767).astype(np.int16)
 
-    out = np.clip(out, -1.0, 1.0)
-    pcm = (out * 32767).astype(np.int16)
+    if not file_is_longer:
+        sf.write(output_path, pcm, sr, subtype="PCM_16")
+        return output_path
 
-    if output_path is None:
-        base = os.path.splitext(input_path)[0]
-        output_path = base + "_wm.wav"
+    # File has a tail: write the marked head to a temp WAV, then stitch.
+    head_wav = output_path + ".head.wav"
+    try:
+        sf.write(head_wav, pcm, sr, subtype="PCM_16")
+        _stitch_with_tail(head_wav, input_path, _REQUIRED / sr, sr, output_path)
+    finally:
+        if os.path.exists(head_wav):
+            os.remove(head_wav)
 
-    sf.write(output_path, pcm, sr, subtype="PCM_16")
     return output_path
 
 
 def detect_watermark(input_path: str) -> int:
     """Detect and return the embedded user_id, or -1 if signal is too short."""
-    samples, _ = _load_mono_float(input_path)
+    samples, _, _ = _load_head(input_path, _REQUIRED)
 
     if len(samples) < _REQUIRED:
         return -1

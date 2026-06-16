@@ -1,25 +1,23 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useState } from "react";
 
 interface EmbedResult {
-  userId: number;
-  orderId: string;
+  orderId: number;
+  watermarkCode: number;
+  masterKey: string;
   resultKey: string;
   watermarkUrl: string;
+  fromCache: boolean;
 }
 
 export default function Home() {
   // ---- Embed state ----
   const [file, setFile] = useState<File | null>(null);
-  const [userId, setUserId] = useState("4582");
+  const [orderId, setOrderId] = useState("1001");
   const [embedding, setEmbedding] = useState(false);
   const [embed, setEmbed] = useState<EmbedResult | null>(null);
   const [embedError, setEmbedError] = useState<string | null>(null);
-
-  // Object URL for playing the chosen original locally (no upload needed).
-  const originalUrl = useMemo(() => (file ? URL.createObjectURL(file) : null), [file]);
-  useEffect(() => () => { if (originalUrl) URL.revokeObjectURL(originalUrl); }, [originalUrl]);
 
   // ---- Detect state ----
   const [detecting, setDetecting] = useState(false);
@@ -37,7 +35,7 @@ export default function Home() {
     try {
       const fd = new FormData();
       fd.append("file", file);
-      fd.append("user_id", userId);
+      fd.append("order_id", orderId);
       const res = await fetch("/api/embed", { method: "POST", body: fd });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error ?? `Request failed (${res.status})`);
@@ -49,9 +47,7 @@ export default function Home() {
     }
   }
 
-  // Verify the watermark survived by detecting the just-embedded result. We
-  // pass the S3 key (not the file) so the server reads it directly and there's
-  // no browser→S3 CORS hop.
+  // Detect using the S3 key returned by the embed (server reads directly from S3).
   async function detectResult() {
     if (!embed) return;
     setDetecting(true);
@@ -92,14 +88,14 @@ export default function Home() {
     }
   }
 
-  const expectedId = Number(userId);
+  const expectedId = Number(orderId);
   const detectMatches = detected !== null && detected === expectedId;
 
   return (
     <main>
       <h1>Audio Watermark — Test Console</h1>
       <p className="subtitle">
-        Embed via the deployed AWS API, then verify by detecting locally. For testing only.
+        Upload a master → watermark with order ID → play the MP3 → detect locally.
       </p>
 
       {/* ---------------- Embed ---------------- */}
@@ -107,7 +103,7 @@ export default function Home() {
         <h2>1 · Embed a watermark (AWS)</h2>
         <div className="row">
           <div>
-            <label htmlFor="audio">Audio file (MP3 / WAV)</label>
+            <label htmlFor="audio">Master audio file (WAV recommended)</label>
             <input
               id="audio"
               type="file"
@@ -116,29 +112,23 @@ export default function Home() {
             />
           </div>
           <div>
-            <label htmlFor="uid">User ID (32-bit integer)</label>
+            <label htmlFor="oid">Order ID (WooCommerce order number)</label>
             <input
-              id="uid"
+              id="oid"
               type="number"
-              min={0}
-              value={userId}
-              onChange={(e) => setUserId(e.target.value)}
+              min={1}
+              value={orderId}
+              onChange={(e) => setOrderId(e.target.value)}
             />
           </div>
         </div>
 
-        {originalUrl && (
-          <>
-            <label>Original</label>
-            <audio src={originalUrl} controls />
-          </>
-        )}
-
         <button onClick={runEmbed} disabled={!file || embedding}>
-          {embedding ? "Embedding…" : "Embed via AWS"}
+          {embedding ? "Processing…" : "Watermark via AWS"}
         </button>
         <p className="hint">
-          Uploads to S3 → calls the Lambda → presigns the watermarked result.
+          Uploads master → calls /products/upload-url → /watermark → returns MP3 link.
+          Idempotent: re-running the same order ID returns a fresh link instantly.
         </p>
 
         {embedError && <div className="result err">{embedError}</div>}
@@ -146,13 +136,13 @@ export default function Home() {
         {embed && (
           <div className="result ok">
             <div>
-              Embedded user_id <strong>{embed.userId}</strong> · order{" "}
-              <code>{embed.orderId}</code>
+              Watermark code <strong>{embed.watermarkCode}</strong> (order {embed.orderId})
+              {embed.fromCache && <span className="hint"> · served from cache</span>}
             </div>
-            <label style={{ marginTop: "0.75rem" }}>Watermarked</label>
+            <label style={{ marginTop: "0.75rem" }}>Watermarked MP3</label>
             <audio src={embed.watermarkUrl} controls />
-            <a className="download" href={embed.watermarkUrl} download={`${embed.orderId}.wav`}>
-              ↓ Download watermarked WAV
+            <a className="download" href={embed.watermarkUrl} download={`order-${embed.orderId}.mp3`}>
+              ↓ Download watermarked MP3
             </a>
           </div>
         )}
@@ -163,19 +153,25 @@ export default function Home() {
         <h2>2 · Detect a watermark (local CLI)</h2>
 
         {embed ? (
-          <button className="secondary" onClick={detectResult} disabled={detecting}>
-            {detecting ? "Detecting…" : "Detect the result above"}
-          </button>
+          <>
+            <button className="secondary" onClick={detectResult} disabled={detecting}>
+              {detecting ? "Detecting…" : "Detect the master above"}
+            </button>
+            <p className="hint">
+              Detects from the master S3 key (watermark is also in the MP3, but
+              detection requires the uncompressed WAV used before transcoding).
+            </p>
+          </>
         ) : (
-          <p className="hint">Embed something first, or upload a file below to detect.</p>
+          <p className="hint">Embed something first, or upload a WAV file below to detect.</p>
         )}
 
         <div style={{ marginTop: "1.25rem" }}>
-          <label htmlFor="detectAudio">…or detect any audio file</label>
+          <label htmlFor="detectAudio">…or detect any watermarked WAV</label>
           <input
             id="detectAudio"
             type="file"
-            accept="audio/*,.mp3,.wav,.flac"
+            accept=".wav,audio/wav"
             onChange={(e) => setDetectFile(e.target.files?.[0] ?? null)}
           />
           <button className="secondary" onClick={detectUpload} disabled={!detectFile || detecting}>
@@ -188,13 +184,13 @@ export default function Home() {
         {detected !== null && (
           <div className={`result ${detectMatches ? "ok" : "err"}`}>
             <div>
-              Detected user_id: <span className="badge">{detected}</span>
+              Detected order ID (watermark code): <span className="badge">{detected}</span>
             </div>
             {embed && (
               <div className="hint">
                 {detectMatches
-                  ? `✓ matches the embedded id (${expectedId})`
-                  : `✗ does not match the embedded id (${expectedId})`}
+                  ? `✓ matches the embedded order ID (${expectedId})`
+                  : `✗ does not match the embedded order ID (${expectedId})`}
               </div>
             )}
           </div>

@@ -1,20 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getConfig } from "@/lib/config";
-import { presignGet, putObject } from "@/lib/aws";
 
-export const runtime = "nodejs"; // uses the AWS SDK + Buffer — not the edge runtime
-
-// order_id is validated by the Lambda as ^[A-Za-z0-9_\-]+$ (it ends up in the
-// S3 key), so we generate one that always satisfies that.
-function newOrderId(): string {
-  return `web-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-}
-
-// Keep an upload key that is a safe relative S3 path (no traversal, no spaces).
-function uploadKey(orderId: string, filename: string): string {
-  const ext = (filename.match(/\.[A-Za-z0-9]+$/)?.[0] ?? "").toLowerCase();
-  return `uploads/${orderId}${ext}`;
-}
+export const runtime = "nodejs";
 
 export async function POST(req: NextRequest) {
   let cfg;
@@ -26,87 +13,105 @@ export async function POST(req: NextRequest) {
 
   const form = await req.formData();
   const file = form.get("file");
-  const userIdRaw = form.get("user_id");
+  const orderIdRaw = form.get("order_id");
 
   if (!(file instanceof File)) {
     return NextResponse.json({ error: "No audio file provided" }, { status: 400 });
   }
-  const userId = Number(userIdRaw);
-  if (!Number.isInteger(userId) || userId < 0 || userId >= 2 ** 32) {
+  const orderId = Number(orderIdRaw);
+  if (!Number.isInteger(orderId) || orderId < 1 || orderId > 2 ** 32 - 1) {
     return NextResponse.json(
-      { error: "user_id must be a 32-bit non-negative integer" },
+      { error: "order_id must be a positive 32-bit integer (WooCommerce order ID)" },
       { status: 400 },
     );
   }
 
-  const orderId = newOrderId();
-  const s3Key = uploadKey(orderId, file.name);
-  const bytes = Buffer.from(await file.arrayBuffer());
+  const apiHeaders: Record<string, string> = { "Content-Type": "application/json" };
+  if (cfg.apiKey) apiHeaders["x-api-key"] = cfg.apiKey;
 
-  // 1. Stage the master in S3 so the Lambda can read it by key.
-  try {
-    await putObject(s3Key, bytes, file.type || "application/octet-stream");
-  } catch (err) {
-    return NextResponse.json(
-      { error: `Failed to upload to S3: ${(err as Error).message}` },
-      { status: 502 },
-    );
-  }
-
-  // 2. Invoke the deployed watermark API (embeds + writes temp/{order}_{user}.wav).
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (cfg.apiKey) headers["x-api-key"] = cfg.apiKey;
-
-  let apiRes: Response;
-  try {
-    apiRes = await fetch(cfg.apiUrl, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        s3_key: s3Key,
-        user_id: userId,
-        email: cfg.notifyEmail,
-        order_id: orderId,
-      }),
-    });
-  } catch (err) {
-    return NextResponse.json(
+  // Step 1: get a presigned PUT URL from the service so we can upload directly to S3.
+  const uploadUrlRes = await fetch(`${cfg.apiBaseUrl}/products/upload-url`, {
+    method: "POST",
+    headers: apiHeaders,
+    body: JSON.stringify({
+      product_id: `web-test`,
+      filename: file.name,
+      content_type: file.type || "audio/wav",
+    }),
+  }).catch((err) =>
+    NextResponse.json(
       { error: `Could not reach the watermark API: ${(err as Error).message}` },
       { status: 502 },
+    ),
+  );
+  if (uploadUrlRes instanceof NextResponse) return uploadUrlRes;
+  if (!uploadUrlRes.ok) {
+    const text = await uploadUrlRes.text();
+    return NextResponse.json(
+      { error: `upload-url API returned ${uploadUrlRes.status}: ${text}` },
+      { status: 502 },
+    );
+  }
+  const { upload_url: uploadUrl, s3_key: s3Key } = await uploadUrlRes.json();
+
+  // Step 2: PUT the file directly to S3 using the presigned URL.
+  const bytes = Buffer.from(await file.arrayBuffer());
+  const putRes = await fetch(uploadUrl, {
+    method: "PUT",
+    body: bytes,
+    headers: { "Content-Type": file.type || "audio/wav" },
+  }).catch((err) =>
+    NextResponse.json(
+      { error: `S3 upload failed: ${(err as Error).message}` },
+      { status: 502 },
+    ),
+  );
+  if (putRes instanceof NextResponse) return putRes;
+  if (!putRes.ok) {
+    return NextResponse.json(
+      { error: `S3 PUT returned ${putRes.status}` },
+      { status: 502 },
     );
   }
 
-  const apiText = await apiRes.text();
-  if (!apiRes.ok) {
-    // 403 here almost always means the API now requires x-api-key — surface that.
+  // Step 3: call /watermark — embeds order_id as the watermark code and
+  // transcodes to MP3. Idempotent: re-calling returns a fresh presigned URL.
+  const wmRes = await fetch(`${cfg.apiBaseUrl}/watermark`, {
+    method: "POST",
+    headers: apiHeaders,
+    body: JSON.stringify({ master_key: s3Key, order_id: orderId }),
+  }).catch((err) =>
+    NextResponse.json(
+      { error: `Could not reach the watermark API: ${(err as Error).message}` },
+      { status: 502 },
+    ),
+  );
+  if (wmRes instanceof NextResponse) return wmRes;
+  if (!wmRes.ok) {
+    const text = await wmRes.text();
     const hint =
-      apiRes.status === 403
-        ? " (the endpoint may now require an API key — set WATERMARK_API_KEY in .env.local)"
+      wmRes.status === 403
+        ? " (set WATERMARK_API_KEY in .env.local)"
         : "";
     return NextResponse.json(
-      { error: `Watermark API returned ${apiRes.status}: ${apiText}${hint}` },
+      { error: `Watermark API returned ${wmRes.status}: ${text}${hint}` },
       { status: 502 },
     );
   }
 
-  // 3. The Lambda always writes the result to this deterministic key.
-  const resultKey = `temp/${orderId}_${userId}.wav`;
-  let watermarkUrl: string;
-  try {
-    watermarkUrl = await presignGet(resultKey);
-  } catch (err) {
-    return NextResponse.json(
-      { error: `Watermark succeeded but presigning the result failed: ${(err as Error).message}` },
-      { status: 502 },
-    );
-  }
+  const { download_url: downloadUrl, watermark_code: watermarkCode, from_cache: fromCache } =
+    await wmRes.json();
+
+  // The watermarked buyer copy lives at this deterministic key.
+  const resultKey = `orders/${orderId}.mp3`;
 
   return NextResponse.json({
     status: "ok",
-    userId,
     orderId,
+    watermarkCode,
+    watermarkUrl: downloadUrl,
+    masterKey: s3Key,
     resultKey,
-    watermarkUrl,
-    apiResponse: apiText,
+    fromCache,
   });
 }

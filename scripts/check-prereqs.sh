@@ -40,7 +40,7 @@ fi
 
 echo
 if $ok; then
-  echo "All prerequisites satisfied. Next: ./scripts/deploy.sh you@example.com"
+  echo "All prerequisites satisfied. Next: ./scripts/deploy.sh"
 else
   echo "Some prerequisites are missing. Fix the ✗ items above, then re-run."
   exit 1
