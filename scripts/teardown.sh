@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Delete everything this project created in AWS so it stops incurring any cost.
 # Empties the S3 bucket first (CloudFormation can't delete a non-empty bucket),
-# then deletes the stack (Lambda, API, SES identity, bucket, and the ECR repo).
+# then deletes the stack (Lambda, API, bucket, and the ECR repo).
 #
 # Usage:  ./scripts/teardown.sh
 set -euo pipefail
@@ -22,7 +22,7 @@ if [[ -n "$BUCKET" && "$BUCKET" != "None" ]]; then
   aws s3 rm "s3://$BUCKET" --recursive --region "$REGION" || true
 fi
 
-echo "==> Deleting stack '${STACK}' (Lambda, API, SES identity, bucket, ECR repo)..."
+echo "==> Deleting stack '${STACK}' (Lambda, API, bucket, ECR repo)..."
 sam delete --stack-name "$STACK" --region "$REGION" --no-prompts
 
 echo "Done. All project resources removed."

@@ -1,119 +1,79 @@
 # audio-watermark-lambda
 
-Forensic audio watermarking service. Embeds a unique 32-bit `user_id` into
-audiobook WAV files using DCT spread-spectrum so leaked copies can be traced
-back to the buyer. Detection recovers the `user_id` from any copy — even after
-MP3 re-encoding at 64 kbps.
+Forensic audio watermarking service for an audiobook shop. It embeds a unique
+32-bit **WooCommerce order ID** into each buyer's copy using DCT spread-spectrum,
+so a leaked file can be traced back to the buyer. Detection recovers the order
+ID from any copy — even after MP3 re-encoding down to 64 kbps.
 
-**Current phase:** local algorithm + Lambda code. No AWS resources deployed yet.
+**Current phase:** Phase 5 — deployable AWS service (S3 + Lambda + API Gateway,
+behind an API key) plus a WooCommerce plugin that uploads masters, watermarks on
+order completion, and serves self-renewing buyer downloads. No SES — WordPress
+handles all customer email.
+
+For a full picture see **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** (components,
+API contract, data model, security) and **[docs/USE-CASES.md](docs/USE-CASES.md)**
+(end-to-end flows + known limitations).
 
 ---
 
-## Continuing development on your Mac
+## How it works (one paragraph)
+
+The admin uploads an audiobook master from the WooCommerce product screen; the
+browser PUTs it straight to S3 under `masters/` via a presigned URL (no AWS keys
+in WordPress). When an order completes, the plugin calls the service, which
+copies the master, embeds the order ID, transcodes to MP3 128 kbps, and stores
+the buyer copy at `orders/<order_id>.mp3`. Buyer downloads are minted fresh on
+every click (1-hour presigned URL), and the stored copy auto-expires after 30
+days — re-created on demand from the master if the buyer returns. To trace a
+leak, run `cli.py detect` on the file; the recovered code is the order ID.
+
+```
+ADMIN ── upload master ──▶ S3 masters/<product_id>/<file>
+ORDER completed ── POST /watermark ──▶ embed order_id → MP3 → S3 orders/<order_id>.mp3
+BUYER ── download ──▶ fresh presigned GET (re-generated after 30-day expiry)
+LEAK ── cli.py detect ──▶ order_id ──▶ WooCommerce order ──▶ buyer
+```
+
+---
+
+## Local development (no AWS required)
 
 ### 1. Prerequisites
 
-Install the following before cloning:
+- **Python 3.11+**
+- **ffmpeg** on `PATH` (required for MP3 decode/transcode and the roundtrip test)
 
-**Homebrew** (if not already installed):
 ```bash
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+brew install python@3.11 ffmpeg     # macOS
 ```
 
-**Python 3.11+:**
-```bash
-brew install python@3.11
-```
-
-Verify: `python3.11 --version` should print `3.11.x` or higher.
-
-**ffmpeg** (required for MP3 roundtrip tests and the `roundtrip-test` CLI command):
-```bash
-brew install ffmpeg
-```
-
-Verify: `ffmpeg -version` should print version info.
-
----
-
-### 2. Clone and set up
+### 2. Set up
 
 ```bash
 git clone https://github.com/l-k-sfr-jt/audio-watermark.git
 cd audio-watermark
-```
-
-Create and activate a virtual environment (keeps dependencies isolated):
-```bash
-python3.11 -m venv .venv
-source .venv/bin/activate
-```
-
-Install dependencies:
-```bash
+python3.11 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
----
-
-### 3. Run the test suite
+### 3. Run the tests
 
 ```bash
 pytest tests/ -v
 ```
 
-Expected output — all 6 tests should pass (including the 2 MP3 robustness
-tests now that ffmpeg is installed):
+The MP3 robustness tests skip gracefully if ffmpeg is not installed.
 
-```
-tests/test_watermark.py::test_embed_detect_roundtrip     PASSED
-tests/test_watermark.py::test_different_user_ids         PASSED
-tests/test_watermark.py::test_output_is_wav              PASSED
-tests/test_watermark.py::test_short_audio_padded         PASSED
-tests/test_watermark.py::test_mp3_64kbps_roundtrip       PASSED
-tests/test_watermark.py::test_mp3_128kbps_roundtrip      PASSED
-```
+### 4. Use the CLI
 
-If the MP3 tests still skip, run `which ffmpeg` — it must be on your `PATH`
-and visible to the Python process. With Homebrew you may need to restart your
-terminal or run `eval "$(/opt/homebrew/bin/brew shellenv)"` first.
-
----
-
-### 4. Validate the watermark on a real audiobook
-
-This is the primary local validation step before moving to AWS.
-
-**Embed:**
 ```bash
-python cli.py embed /path/to/audiobook.mp3 12345 output.wav
+python cli.py embed input.mp3 12345 output.wav    # embed code 12345
+python cli.py detect output.wav                   # → Detected user_id: 12345
+python cli.py roundtrip-test input.mp3 12345      # embed → 64 & 128 kbps MP3 → detect
 ```
 
-**Detect:**
-```bash
-python cli.py detect output.wav
-# → Detected user_id: 12345
-```
-
-**Full MP3 roundtrip test** (embed → 64 kbps + 128 kbps MP3 → detect):
-```bash
-python cli.py roundtrip-test /path/to/audiobook.mp3 12345
-```
-
-Expected output:
-```
-Embedding watermark (user_id=12345) …
-  [PASS] 64 kbps — expected 12345, detected 12345
-  [PASS] 128 kbps — expected 12345, detected 12345
-```
-
-A `[FAIL]` at 64 kbps means the audio has unusually low energy in the
-1.6–5.4 kHz DCT band. Increase `ALPHA` in `src/watermark.py` (try `0.08`)
-and re-test.
-
-**Listen for audibility:** open `output.wav` in any audio player and compare
-it to the original. The watermark should be completely inaudible. If you hear
-any artefacts, reduce `ALPHA`.
+`detect` is also the forensic step: run it on a recovered leaked file to recover
+the order ID.
 
 ---
 
@@ -121,58 +81,76 @@ any artefacts, reduce `ALPHA`.
 
 ```
 src/
-  handler.py    # Lambda entry point — validates input, orchestrates all steps
-  watermark.py  # Core DCT algorithm — no AWS imports (runs identically locally)
-  storage.py    # S3 download / upload / presigned URL (boto3)
-  notify.py     # SES email dispatch (boto3)
+  handler.py    # Lambda entry — routes /products/upload-url and /watermark
+  watermark.py  # DCT algorithm: embed/detect + transcode_to_mp3 (NO AWS imports)
+  storage.py    # S3 helpers: download/upload/object_exists/presign (boto3)
 tests/
-  test_watermark.py   # Roundtrip + MP3 robustness unit tests
-  sample_audio/       # Drop short test fixtures here
-cli.py          # Local CLI: embed / detect / roundtrip-test
+  test_watermark.py   # embed/detect roundtrip + MP3 robustness
+  sample_audio/       # short test fixtures
+cli.py          # local embed / detect / roundtrip-test (no AWS)
 requirements.txt
-Dockerfile      # Container-image Lambda (bundles ffmpeg for MP3 decoding)
-template.yaml   # SAM template — provisions S3 + SES + Lambda + API
+Dockerfile      # container-image Lambda (bundles ffmpeg + scientific stack)
+template.yaml   # SAM: S3 + Lambda + API Gateway + API key + usage plan
 samconfig.toml  # SAM deploy defaults (region eu-central-1)
-scripts/        # check-prereqs / deploy / verify-recipient / smoke-test / teardown
+scripts/        # check-prereqs / deploy / smoke-test / teardown
 docs/
-  DEPLOYMENT.md # Zero-to-deployed AWS guide (account → live service)
+  ARCHITECTURE.md   # components, API, data model, security
+  USE-CASES.md      # flows + known limitations
+  DEPLOYMENT.md     # zero-to-deployed AWS guide
+web/            # Next.js test console (upload → watermark → play → detect)
+wordpress/
+  audio-watermark-woo/   # WooCommerce plugin
 ```
+
+---
+
+## API endpoints (both behind `x-api-key`)
+
+| Endpoint | Purpose |
+|----------|---------|
+| `POST /products/upload-url` | Returns a presigned S3 PUT (15 min) so a browser uploads a master directly. |
+| `POST /watermark` | Idempotent: watermark a master for an order ID and return a presigned GET (1 h). Serves both first purchase and re-download. |
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full request/response
+contract and validation rules.
 
 ---
 
 ## Environment variables (Lambda)
 
-| Variable          | Description                           |
-|-------------------|---------------------------------------|
-| `BUCKET_NAME`     | S3 bucket for source and output audio |
-| `SES_FROM_EMAIL`  | SES-verified sender address           |
+| Variable      | Description             |
+|---------------|-------------------------|
+| `BUCKET_NAME` | S3 bucket for all audio |
 
 ---
 
-## AWS deployment (Phase 3)
+## AWS deployment
 
-Full zero-to-deployed instructions — including creating the AWS account — are in
-**[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)**. The infrastructure is defined in
-`template.yaml` (S3 bucket + SES identity + container-image Lambda + API
-Gateway) and deployed with one script per stage.
-
-Quick path once you have an AWS account and `aws`/`sam`/Docker installed:
+Full zero-to-deployed instructions (including creating the AWS account) are in
+**[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)**. Quick path once you have an AWS
+account and `aws`/`sam`/Docker installed:
 
 ```bash
-./scripts/check-prereqs.sh                              # verify tooling + creds
-./scripts/deploy.sh noreply@yourdomain.com              # build image + deploy stack
-# → click the SES verification link AWS emails to that address
-./scripts/verify-recipient.sh you@example.com           # SES sandbox: verify a test inbox
-./scripts/smoke-test.sh audiobook.mp3 you@example.com   # upload, invoke, email the link
-./scripts/teardown.sh                                   # remove everything when done
+./scripts/check-prereqs.sh                          # verify tooling + creds
+./scripts/deploy.sh                                 # build image + deploy stack
+./scripts/smoke-test.sh path/to/audiobook.wav 123   # upload → watermark → download → idempotency → 403 check
+./scripts/teardown.sh                               # remove everything when done
 ```
 
-The Lambda is packaged as a **container image** (`Dockerfile`) so ffmpeg and the
-scientific Python stack are bundled — no Lambda layer juggling, and MP3/WAV/FLAC
-masters all decode. Region defaults to **eu-central-1**.
+`deploy.sh` prints the **API base URL** and **API key** to paste into the
+WooCommerce plugin (WooCommerce → Settings → Audiobook WM). The Lambda is a
+**container image** so ffmpeg and the scientific stack are bundled. Region
+defaults to **eu-central-1**.
 
-**Next (Phase 4):** the `/watermark` API endpoint is open by design for now;
-add an API key or Lambda authorizer before wiring it to WooCommerce.
+---
+
+## WooCommerce plugin
+
+In `wordpress/audio-watermark-woo/`. Declares HPOS compatibility; provides a
+settings tab (API URL + key), a product panel (enable checkbox + master upload),
+order-completion watermarking, and per-item self-renewing download buttons on
+the customer's order page. See [docs/USE-CASES.md](docs/USE-CASES.md) for the
+end-to-end flows.
 
 ---
 
@@ -180,26 +158,25 @@ add an API key or Lambda authorizer before wiring it to WooCommerce.
 
 | Parameter | Location | Effect |
 |-----------|----------|--------|
-| `ALPHA` | `src/watermark.py` | Embedding strength — the mark is `ALPHA ×` a per-frequency masking envelope, so it hides under the audio's own spectrum. Higher = more robust, more audible. Start at 0.05; raise toward 0.1 if 64 kbps detection fails, lower toward 0.03 if you can still hear it. |
-| `SPREAD_BINS` | `src/watermark.py` | How far the masking envelope spreads around each tone (~120 Hz at 11). Smaller hugs the tones more tightly (quieter, especially on sparse/tonal music) but leaves detection less margin. |
-| `SILENCE_FLOOR` | `src/watermark.py` | Minimum mark level in deep spectral gaps / silence. Lower it (e.g. 0.0005) if you hear faint noise in quiet passages; raise it if detection is shaky on very quiet audio. |
-| `NUM_BLOCKS` | `src/watermark.py` | More blocks = stronger watermark but longer processing region. 256 ≈ 12 s at 44.1 kHz. |
-| `FREQ_LOW/HIGH` | `src/watermark.py` | Mid-frequency band. Avoid going below 100 (speech fundamentals) or above 600 (MP3 strips high freq at low bitrates). |
+| `ALPHA` | `src/watermark.py` | Embedding strength — the mark is `ALPHA ×` a per-frequency masking envelope. Higher = more robust, more audible. Start 0.05; raise toward 0.1 if 64 kbps detection fails, lower toward 0.03 if audible. |
+| `SPREAD_BINS` | `src/watermark.py` | How far the masking envelope spreads around each tone (~120 Hz at 11). Smaller hugs tones tighter (quieter) but gives detection less margin. |
+| `SILENCE_FLOOR` | `src/watermark.py` | Minimum mark level in deep gaps / silence. Lower if you hear faint noise in quiet passages; raise if detection is shaky on very quiet audio. |
+| `NUM_BLOCKS` | `src/watermark.py` | More blocks = stronger mark but longer processing region. 256 ≈ 12 s at 44.1 kHz. |
+| `FREQ_LOW/HIGH` | `src/watermark.py` | Mid-frequency band. Avoid below 100 (speech fundamentals) or above 600 (MP3 strips highs at low bitrate). |
 
 ---
 
 ## Troubleshooting
 
-**`SoundFileError` when loading MP3 locally**
-Your libsndfile build doesn't support MP3. The code falls back to pydub/ffmpeg
-automatically — make sure ffmpeg is installed.
+**`SoundFileError` loading MP3 locally** — libsndfile lacks MP3 support; the code
+falls back to ffmpeg automatically, so just ensure ffmpeg is installed.
 
-**`FileNotFoundError` from pydub**
-ffmpeg is not on PATH. Run `which ffmpeg` and `brew install ffmpeg` if missing.
+**`ModuleNotFoundError: No module named 'src'`** — run commands from the repo
+root, not inside `src/`.
 
-**`ModuleNotFoundError: No module named 'src'`**
-Run commands from the repo root (`audio-watermark/`), not from inside `src/`.
+**`/watermark` returns 404 "Master not found in S3"** — the `master_key` doesn't
+exist under `masters/`. Confirm the upload succeeded and the key matches exactly.
 
-**Detection returns wrong user_id on a real audiobook**
-The audio may have very low energy in the 1.6–5.4 kHz band. Increase `ALPHA`
-to `0.04` and re-embed. Run `python cli.py roundtrip-test` again to confirm.
+**Detection returns the wrong code on a real audiobook** — the audio may have
+very low energy in the embedding band. Increase `ALPHA` and re-embed; confirm
+with `python cli.py roundtrip-test`.
