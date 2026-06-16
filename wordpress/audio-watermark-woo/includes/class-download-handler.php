@@ -74,7 +74,7 @@ class Audio_WM_Download_Handler {
             if ( ! ( $item instanceof WC_Order_Item_Product ) ) {
                 continue;
             }
-            $master_key = wc_get_order_item_meta( $item_id, '_audio_wm_master_key', true );
+            $master_key = $item->get_meta( '_audio_wm_master_key' );
             if ( $master_key ) {
                 $watermarked_items[ $item_id ] = $item->get_name();
             }
@@ -170,11 +170,13 @@ class Audio_WM_Download_Handler {
             return;
         }
 
-        $master_key = wc_get_order_item_meta( $item_id, '_audio_wm_master_key', true );
+        // Load the item from the already-loaded order object; this simultaneously
+        // confirms the item belongs to this order (get_item returns null otherwise).
+        $item       = $order->get_item( $item_id );
+        $master_key = ( $item instanceof WC_Order_Item_Product )
+            ? $item->get_meta( '_audio_wm_master_key' )
+            : '';
 
-        // wc_get_order_item_meta returns '' for non-existent meta, which covers
-        // both "item does not exist" and "item not in this order" cases because
-        // item meta is tied to the item row in the database (not order-scoped).
         if ( ! $master_key ) {
             wp_die(
                 esc_html__( 'Could not generate download link. Please contact support.', 'audio-watermark-woo' ),

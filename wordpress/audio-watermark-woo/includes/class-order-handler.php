@@ -63,7 +63,8 @@ class Audio_WM_Order_Handler {
                 // Store the master key in ITEM meta so each product in the order
                 // can be downloaded independently (order meta would be overwritten
                 // on each iteration if the order contains multiple audio products).
-                wc_update_order_item_meta( $item_id, '_audio_wm_master_key', $master_key );
+                $item->update_meta_data( '_audio_wm_master_key', $master_key );
+                $item->save();
                 $any_watermarked = true;
 
                 error_log( sprintf(

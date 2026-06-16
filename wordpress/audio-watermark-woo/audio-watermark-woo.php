@@ -18,6 +18,14 @@ define( 'AUDIO_WM_VERSION',    '1.0.0' );
 define( 'AUDIO_WM_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'AUDIO_WM_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
 
+// Declare HPOS (High-Performance Order Storage) compatibility so WC 7+ HPOS
+// feature works without a compatibility warning in WooCommerce > Status.
+add_action( 'before_woocommerce_init', function () {
+    if ( class_exists( \Automattic\WooCommerce\Utilities\FeaturesUtil::class ) ) {
+        \Automattic\WooCommerce\Utilities\FeaturesUtil::declare_compatibility( 'custom_order_tables', __FILE__, true );
+    }
+} );
+
 /**
  * Activation hook — options have defaults so nothing to set up here.
  */
