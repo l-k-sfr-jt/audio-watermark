@@ -177,6 +177,9 @@ def route_watermark(event: dict) -> dict:
     download_name = f"{_stem}_order{order_id}.mp3"
 
     # Idempotent fast path: serve an existing buyer copy without re-watermarking.
+    # If the cache check itself fails (e.g. S3 permissions issue), log and skip
+    # to the slow path rather than returning an error — the watermark call will
+    # still work as long as GetObject and PutObject are allowed.
     try:
         if storage.object_exists(bucket, output_key):
             download_url = storage.generate_presigned_url(bucket, output_key, filename=download_name)
@@ -191,8 +194,7 @@ def route_watermark(event: dict) -> dict:
             )
             return _ok({"download_url": download_url, "watermark_code": order_id, "from_cache": True})
     except Exception as exc:
-        logger.error("object_exists check failed for key=%s: %s", output_key, exc)
-        return _error(500, "Storage check failed")
+        logger.warning("object_exists check failed for key=%s (skipping cache, continuing to watermark): %s", output_key, exc)
 
     # Slow path: download master → embed watermark → transcode → upload → presign.
     with tempfile.TemporaryDirectory() as tmp_dir:
