@@ -158,10 +158,16 @@ def route_watermark(event: dict) -> dict:
     else:
         output_key = f"orders/{order_id}.mp3"
 
+    # Derive a human-friendly filename from the master key so the browser saves
+    # the file as e.g. "my_audiobook_order456789.mp3" instead of "7.mp3".
+    _original_name = master_key.split("/")[-1]
+    _stem = _original_name.rsplit(".", 1)[0] if "." in _original_name else _original_name
+    download_name = f"{_stem}_order{order_id}.mp3"
+
     # Idempotent fast path: serve an existing buyer copy without re-watermarking.
     try:
         if storage.object_exists(bucket, output_key):
-            download_url = storage.generate_presigned_url(bucket, output_key)
+            download_url = storage.generate_presigned_url(bucket, output_key, filename=download_name)
             logger.info(json.dumps({
                 "event": "cache_hit", "order_id": order_id,
                 "item_id": item_id_raw, "output_key": output_key,
@@ -215,7 +221,7 @@ def route_watermark(event: dict) -> dict:
             return _error(500, "Failed to store processed audio")
 
         try:
-            download_url = storage.generate_presigned_url(bucket, output_key)
+            download_url = storage.generate_presigned_url(bucket, output_key, filename=download_name)
         except Exception as exc:
             logger.error("generate_presigned_url failed for key=%s: %s", output_key, exc)
             return _error(500, "Failed to generate download link")

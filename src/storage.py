@@ -55,15 +55,18 @@ def generate_presigned_put(bucket: str, key: str, content_type: str, expiry: int
     )
 
 
-def generate_presigned_url(bucket: str, key: str, expiry: int = 3600) -> str:
+def generate_presigned_url(bucket: str, key: str, expiry: int = 3600, filename: str | None = None) -> str:
     """Return a presigned GET URL valid for `expiry` seconds (default 1 h).
 
     Signed with the Lambda execution role (STS credentials). Since buyer copies
     are re-minted on every download request and expire in 1 h, they will always
     be regenerated before the STS session (≤12 h) expires.
+
+    If `filename` is provided it is set as the Content-Disposition attachment
+    name so the browser saves the file with a meaningful name instead of the
+    raw S3 key segment.
     """
-    return _s3().generate_presigned_url(
-        "get_object",
-        Params={"Bucket": bucket, "Key": key},
-        ExpiresIn=expiry,
-    )
+    params: dict = {"Bucket": bucket, "Key": key}
+    if filename:
+        params["ResponseContentDisposition"] = f'attachment; filename="{filename}"'
+    return _s3().generate_presigned_url("get_object", Params=params, ExpiresIn=expiry)

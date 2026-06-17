@@ -61,59 +61,65 @@ class Audio_WM_Download_Handler {
             return;
         }
 
-        // Order must have been watermarked.
-        if ( ! $order->get_meta( '_watermark_code', true ) ) {
-            return;
-        }
-
         $order_id = $order->get_id();
+        $nonce    = wp_create_nonce( 'audio_wm_download_' . $order_id );
+        $sections = [];
 
-        // Collect watermarked items that have a stored master key in item meta.
-        $watermarked_items = [];
         foreach ( $order->get_items() as $item_id => $item ) {
             if ( ! ( $item instanceof WC_Order_Item_Product ) ) {
                 continue;
             }
+
+            $product_id = (int) $item->get_product_id();
+            if ( 'yes' !== get_post_meta( $product_id, '_audio_wm_enabled', true ) ) {
+                continue;
+            }
+
             $master_key = $item->get_meta( '_audio_wm_master_key' );
             if ( $master_key ) {
-                $watermarked_items[ $item_id ] = $item->get_name();
+                // Item watermarked: show download button.
+                $download_url = add_query_arg(
+                    [
+                        'action'   => 'audio_wm_download',
+                        'order_id' => $order_id,
+                        'item_id'  => $item_id,
+                        '_wpnonce' => $nonce,
+                    ],
+                    admin_url( 'admin-ajax.php' )
+                );
+                $sections[] = sprintf(
+                    '<p><a href="%s" class="button" target="_blank">%s</a></p>',
+                    esc_url( $download_url ),
+                    esc_html(
+                        sprintf(
+                            /* translators: %s: product name */
+                            __( 'Download: %s', 'audio-watermark-woo' ),
+                            $item->get_name()
+                        )
+                    )
+                );
+            } else {
+                // Item not yet watermarked: let the customer know it's pending.
+                $sections[] = sprintf(
+                    '<p class="audio-wm-pending">%s</p>',
+                    esc_html(
+                        sprintf(
+                            /* translators: %s: product name */
+                            __( '"%s" is being prepared — check back in a few minutes or contact support if this persists.', 'audio-watermark-woo' ),
+                            $item->get_name()
+                        )
+                    )
+                );
             }
         }
 
-        if ( empty( $watermarked_items ) ) {
+        if ( empty( $sections ) ) {
             return;
         }
 
-        $nonce = wp_create_nonce( 'audio_wm_download_' . $order_id );
-
         echo '<section class="audio-wm-downloads" style="margin-top:1.5em;">';
         echo '<h2>' . esc_html__( 'Audiobook Downloads', 'audio-watermark-woo' ) . '</h2>';
-
-        foreach ( $watermarked_items as $item_id => $item_name ) {
-            // Each item gets its own URL so the correct master file is served.
-            $download_url = add_query_arg(
-                [
-                    'action'   => 'audio_wm_download',
-                    'order_id' => $order_id,
-                    'item_id'  => $item_id,
-                    '_wpnonce' => $nonce,
-                ],
-                admin_url( 'admin-ajax.php' )
-            );
-
-            printf(
-                '<p><a href="%s" class="button" target="_blank">%s</a></p>',
-                esc_url( $download_url ),
-                esc_html(
-                    sprintf(
-                        /* translators: %s: product name */
-                        __( 'Download: %s', 'audio-watermark-woo' ),
-                        $item_name
-                    )
-                )
-            );
-        }
-
+        echo implode( '', $sections ); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- each fragment is already escaped above
         echo '</section>';
     }
 
@@ -154,6 +160,19 @@ class Audio_WM_Download_Handler {
         if ( ! $current_user_id || $current_user_id !== (int) $order->get_customer_id() ) {
             wp_die(
                 esc_html__( 'You do not have permission to download this file.', 'audio-watermark-woo' ),
+                '',
+                [ 'response' => 403 ]
+            );
+            return;
+        }
+
+        // ── Order status check ───────────────────────────────────────────────
+        // Only allow downloads for active orders (completed or still processing).
+        // Refunded, cancelled, or failed orders lose download access.
+        $allowed_statuses = [ 'completed', 'processing' ];
+        if ( ! in_array( $order->get_status(), $allowed_statuses, true ) ) {
+            wp_die(
+                esc_html__( 'This order is no longer eligible for downloads.', 'audio-watermark-woo' ),
                 '',
                 [ 'response' => 403 ]
             );

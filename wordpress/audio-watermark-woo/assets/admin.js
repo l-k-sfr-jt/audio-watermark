@@ -162,4 +162,48 @@
         } );
     } );
 
+    // ── Settings page: "Test connection" button ──────────────────────────────
+
+    document.addEventListener( 'DOMContentLoaded', function () {
+        var testBtn    = document.getElementById( 'audio-wm-test-btn' );
+        var testResult = document.getElementById( 'audio-wm-test-result' );
+
+        if ( ! testBtn || ! testResult ) {
+            return;
+        }
+        if ( typeof window.AudioWMSettings === 'undefined' ) {
+            return;
+        }
+
+        testBtn.addEventListener( 'click', function ( e ) {
+            e.preventDefault();
+            testBtn.disabled    = true;
+            testResult.textContent = 'Testing…';
+            testResult.style.color = '#666';
+
+            var fd = new FormData();
+            fd.append( 'action', 'audio_wm_test_connection' );
+            fd.append( 'nonce',  window.AudioWMSettings.nonce );
+
+            fetch( window.AudioWMSettings.ajax_url, { method: 'POST', body: fd } )
+                .then( function ( r ) { return r.json(); } )
+                .then( function ( data ) {
+                    if ( data.success ) {
+                        testResult.textContent = '✔ ' + data.data;
+                        testResult.style.color = 'green';
+                    } else {
+                        testResult.textContent = '✖ ' + ( data.data || 'Connection failed.' );
+                        testResult.style.color = '#c00';
+                    }
+                } )
+                .catch( function ( err ) {
+                    testResult.textContent = '✖ ' + ( err.message || 'Request failed.' );
+                    testResult.style.color = '#c00';
+                } )
+                .finally( function () {
+                    testBtn.disabled = false;
+                } );
+        } );
+    } );
+
 } )();

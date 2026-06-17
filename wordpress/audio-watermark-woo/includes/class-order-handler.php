@@ -29,6 +29,9 @@ class Audio_WM_Order_Handler {
         add_action( 'woocommerce_order_status_completed', [ $this, 'process_order' ], 10, 1 );
         // Action Scheduler hook for deferred retry (ships with WooCommerce ≥ 3.5).
         add_action( 'audio_wm_retry_watermark', [ $this, 'retry_watermark' ], 10, 4 );
+        // Manual re-watermark from WC Admin → Orders → Order Actions dropdown.
+        add_filter( 'woocommerce_order_actions',                        [ $this, 'add_rewatermark_action' ] );
+        add_action( 'woocommerce_order_action_audio_wm_rewatermark',    [ $this, 'rewatermark_order' ] );
     }
 
     /**
@@ -225,6 +228,44 @@ class Audio_WM_Order_Handler {
                 ) );
             }
         }
+    }
+
+    /**
+     * Add "Re-watermark audiobook(s)" to the WC Admin order actions dropdown.
+     *
+     * @param array $actions Existing order actions.
+     * @return array
+     */
+    public function add_rewatermark_action( array $actions ): array {
+        $actions['audio_wm_rewatermark'] = __( 'Re-watermark audiobook(s)', 'audio-watermark-woo' );
+        return $actions;
+    }
+
+    /**
+     * Handle the manual re-watermark order action triggered from WC Admin.
+     *
+     * Clears the per-item idempotency guard (_audio_wm_master_key) and the
+     * order-level _watermark_code flag so process_order() runs a fresh pass.
+     * Use this to recover after all automatic retries have been exhausted.
+     *
+     * @param \WC_Order $order The order being acted upon.
+     */
+    public function rewatermark_order( \WC_Order $order ): void {
+        foreach ( $order->get_items() as $item ) {
+            if ( ! ( $item instanceof WC_Order_Item_Product ) ) {
+                continue;
+            }
+            $item->delete_meta_data( '_audio_wm_master_key' );
+            $item->save();
+        }
+        $order->delete_meta_data( '_watermark_code' );
+        $order->save();
+
+        $order->add_order_note(
+            __( '[Audio WM] Manual re-watermark triggered by admin.', 'audio-watermark-woo' )
+        );
+
+        $this->process_order( $order->get_id() );
     }
 
     /**
