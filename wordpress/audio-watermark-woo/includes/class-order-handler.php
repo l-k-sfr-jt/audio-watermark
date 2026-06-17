@@ -365,10 +365,18 @@ class Audio_WM_Order_Handler {
         $raw_body  = wp_remote_retrieve_body( $response );
 
         if ( $http_code < 200 || $http_code >= 300 ) {
-            $detail = '';
+            // The Lambda returns its reason under an "error" key; API Gateway and
+            // other layers may use "message". Surface whichever is present.
+            $detail  = '';
             $decoded = json_decode( $raw_body, true );
-            if ( is_array( $decoded ) && isset( $decoded['message'] ) ) {
-                $detail = ' — ' . $decoded['message'];
+            if ( is_array( $decoded ) ) {
+                if ( isset( $decoded['error'] ) ) {
+                    $detail = ' — ' . $decoded['error'];
+                } elseif ( isset( $decoded['message'] ) ) {
+                    $detail = ' — ' . $decoded['message'];
+                }
+            } elseif ( '' !== trim( (string) $raw_body ) ) {
+                $detail = ' — ' . substr( trim( (string) $raw_body ), 0, 200 );
             }
             throw new \RuntimeException(
                 "Service returned HTTP {$http_code}{$detail}"
