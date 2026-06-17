@@ -153,19 +153,38 @@ Dimensions: `{"Service": "audio-watermark"}`. All log entries are structured JSO
 ## WooCommerce Plugin (wordpress/audio-watermark-woo/)
 
 Admin product panel:
-- Enable watermarking checkbox + multi-file master list + "Add master audio file" button (one upload per file)
+- Enable watermarking checkbox + multi-file master list + "Add master audio files" button (multiple file input; uploads all selected files sequentially)
 - Upload flow: AJAX → /products/upload-url → browser PUT to presigned URL → append s3_key to _audio_wm_s3_keys JSON array
 - Non-audio products (PDFs, physical goods): leave checkbox unchecked; order/download handlers ignore them automatically
 
-Order processing (woocommerce_order_status_completed):
+Order processing (woocommerce_order_status_processing AND _completed):
+- Watermarking fires on BOTH processing and completed (digital goods often stop
+  at "processing" and may never be marked completed). The per-key idempotency
+  guard makes the duplicate event a no-op.
 - For each watermark-enabled line item and each master key in _audio_wm_s3_keys:
   POST /watermark { master_key, order_id, item_id[, part] };
   append the master key to that item's _audio_wm_master_keys JSON array and set
   _watermark_code on the order
+- A delivery email (Audio_WM_Email_Download) is sent at most once automatically
+  per order (guarded by _audio_wm_email_sent), so processing→completed does not
+  double-email.
 
-Customer download (My Account):
-- One "Download: <product> [— <part>]" button per watermarked master file per item
-- Click → AJAX endpoint → POST /watermark { master_key, order_id, item_id[, part] } (idempotent, fresh URL) → 302 redirect
+Customer download (email + thank-you page + My Account):
+- Email links and the order-received/thank-you page work for guests (no login
+  required); the logged-in My Account order page also shows the buttons.
+- One "Download: <product> [— <part>]" button per watermarked master file per item.
+- Auth: logged-in My Account uses a WP nonce; guest (email + thank-you) links use
+  an HMAC signature over the order key ($order->get_order_key(), verified with
+  hash_equals) — never a nonce (won't survive email) and never login. The raw
+  order key never appears in a URL, only the signature.
+- Download links expire after 30 days (matches the S3 ExpireBuyerCopies lifecycle);
+  an expired link shows a "link expired" page with a self-service "request a new
+  link" button. Resend is throttled to once per hour per order
+  (_audio_wm_last_resend) and only emails the address stored on the order.
+- Master-key resolution falls back: item _audio_wm_master_keys → legacy item key →
+  product _audio_wm_s3_keys → legacy product key, so a link mints the file on
+  demand (idempotent /watermark) even before process_order populated item meta.
+- Click → AJAX endpoint (priv + nopriv) → POST /watermark { master_key, order_id, item_id[, part] } (idempotent, fresh URL) → 302 redirect
 - Browser saves as `<stem>_order<order_id>.mp3` (via Content-Disposition)
 
 Forensic lookup: order_id (the watermark code) → look up WooCommerce order → buyer info

@@ -176,15 +176,16 @@ If instead you see:
 You can upload **one or more master files** per product (e.g. separate chapters
 or CD parts — each becomes its own download button for the buyer).
 
-1. Click **Add master audio file**.
-2. Pick a WAV or MP3 file. The browser requests a presigned S3 URL from the
-   service and then uploads the file directly to S3 — it never passes through
-   WordPress.
+1. Click **Add master audio files**.
+2. Pick one **or more** WAV/MP3 files (the picker accepts multiple selections).
+   The browser requests a presigned S3 URL for each and uploads the files directly
+   to S3, one after another — they never pass through WordPress. For a 40-chapter
+   audiobook you can select all the files at once.
 3. Wait for the status line to show:
    > ✔ Upload complete! Save the product to persist.
-4. The file appears in the master file list below the button with its filename
+4. Each file appears in the master file list below the button with its filename
    and a **Remove** link.
-5. **Repeat** steps 1–4 for each additional chapter/part file.
+5. **Repeat** if you want to add more files in a later batch.
 6. Click **Publish** / **Update** to save the product.
 
 > **Single-file audiobook:** just upload one file. The buyer sees one download
@@ -200,9 +201,10 @@ or CD parts — each becomes its own download button for the buyer).
 ### 4c. Set a price and publish
 
 Give the product a price (even £0.01 for testing) and make sure it is
-published and in stock. WooCommerce only marks orders completed automatically
-for free products; for paid products you may need to mark the order completed
-manually in the next step.
+published and in stock. Watermarking now fires automatically as soon as the order
+reaches **processing** (i.e. on payment) as well as on **completed**, so digital
+goods that never get manually marked completed are still watermarked and
+delivered.
 
 ### 4d. Place a test order
 
@@ -210,8 +212,9 @@ manually in the next step.
    window).
 2. Add the product to the cart and complete checkout.
 3. In WooCommerce admin (**WooCommerce → Orders**), find the new order.
-4. Change the order status to **Completed** (or if you used a free/test payment
-   method that auto-completes, it may already be Completed).
+4. The order should reach **Processing** automatically on payment — that already
+   triggers watermarking. (Marking it **Completed** later re-triggers harmlessly;
+   the work is idempotent and the delivery email is sent only once.)
 
 ### 4e. Confirm watermarking happened
 
@@ -223,6 +226,18 @@ manually in the next step.
    or look at the retry notes (automatic retries run at +5 min, +30 min, +2 h).
 
 ### 4f. Download as the customer
+
+The customer can reach their downloads three ways:
+
+- **Delivery email (guests included):** once the order is processing/completed,
+  WooCommerce emails the buyer a download link per audio file/part, plus a
+  durable **"request a new link"** link. Download links expire after 30 days; the
+  re-request link lets the buyer self-serve fresh links (throttled to once per
+  hour) with no login. You can edit the email's subject/heading or enable/disable
+  it under **WooCommerce → Settings → Emails** ("Audiobook download").
+- **Order-received / thank-you page:** the same download buttons appear right
+  after checkout, even for guest buyers.
+- **My Account (logged-in buyers):** as below.
 
 1. As the customer, go to **My Account → Orders → view** the order.
 2. Below the order table you should see an **Audiobook Downloads** section.
@@ -281,12 +296,12 @@ No extra steps are needed — the status check is automatic.
 
 ### Adding, replacing, or removing master audio files
 
-**Add a new chapter/part:** click **Add master audio file** on the product edit
-page, upload the file, and save the product. Future orders will include the new
-file. Existing orders are unaffected.
+**Add a new chapter/part:** click **Add master audio files** on the product edit
+page, upload the file(s), and save the product. Future orders will include the
+new file. Existing orders are unaffected.
 
 **Replace a file:** remove the old entry from the list (click **Remove** next to
-it), then add the new file via **Add master audio file**, and save the product.
+it), then add the new file via **Add master audio files**, and save the product.
 
 **Note on existing buyers:** buyer copies already in S3 (`orders/…`) were created
 from whichever masters were live at order time. Removing or replacing a master

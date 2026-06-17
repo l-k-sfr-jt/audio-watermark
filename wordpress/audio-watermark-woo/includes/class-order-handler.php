@@ -26,6 +26,12 @@ class Audio_WM_Order_Handler {
     const MAX_RETRIES = 3;
 
     public function __construct() {
+        // Watermark as soon as payment is confirmed. Digital goods normally land
+        // in "processing" and only move to "completed" on manual admin action (or
+        // not at all), so hooking only "completed" means the watermark Lambda may
+        // never fire. Hook both; the per-key idempotency guard makes the second
+        // event a no-op.
+        add_action( 'woocommerce_order_status_processing', [ $this, 'process_order' ], 10, 1 );
         add_action( 'woocommerce_order_status_completed', [ $this, 'process_order' ], 10, 1 );
         // Action Scheduler hook for deferred retry (ships with WooCommerce ≥ 3.5).
         // 5 args: order_id, item_id, master_key, part, attempt.

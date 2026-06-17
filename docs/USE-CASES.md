@@ -11,7 +11,8 @@ orders that should be decided on before production.
 
 Actors:
 - **Admin** — shop manager editing products (`edit_products` capability).
-- **Buyer** — logged-in customer who placed an order.
+- **Buyer** — customer who placed an order, logged-in **or** a guest (the shop
+  checks customers out as guests, so the buyer often has no WP login).
 - **Service** — API Gateway + Lambda (`src/handler.py`).
 - **Forensic analyst** — whoever runs `cli.py detect` on a leaked file.
 
@@ -81,15 +82,22 @@ all files are in S3 under `masters/<product_id>/`. **Errors:** nonce/permission
 
 ---
 
-## UC-3 — Order completed → watermark each eligible item
+## UC-3 — Order processing/completed → watermark each eligible item
 
 **Actor:** Service (triggered by WooCommerce) · **Pre:** order reaches
-**completed**; ≥1 item's product has `_audio_wm_enabled=yes` + `_audio_wm_s3_keys`.
+**processing** *or* **completed**; ≥1 item's product has `_audio_wm_enabled=yes`
++ `_audio_wm_s3_keys`.
+
+`process_order` is hooked on **both** `woocommerce_order_status_processing` and
+`woocommerce_order_status_completed`. Digital goods normally sit in "processing"
+and may never be manually marked "completed", so watermarking has to fire on
+payment. The per-key idempotency guard (`_audio_wm_master_keys`) makes the second
+event a no-op, and the delivery email is sent at most once (see UC-7).
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant WC as woocommerce_order_status_completed
+    participant WC as woocommerce_order_status_processing / _completed
     participant OH as Order_Handler::process_order
     participant API as POST /watermark
     participant WM as embed_watermark + transcode_to_mp3
@@ -133,26 +141,45 @@ already-done parts. Does not block order completion.
 
 ## UC-4 — Buyer downloads the audiobook
 
-**Actor:** Buyer · **Pre:** UC-3 set `_watermark_code` on the order; buyer is
-logged in and owns the order.
+**Actor:** Buyer (logged-in or guest) · **Pre:** order is processing/completed;
+≥1 eligible master key resolvable (via item meta **or** the product fallback —
+see below).
+
+The buyer reaches a download button on any of **three surfaces**:
+
+- **Logged-in My Account / order-details page** — `add_download_buttons`
+  (hook `woocommerce_order_details_after_order_table`). Links are **nonce**-
+  authenticated and require the logged-in user to own the order. Unchanged auth.
+- **Order-received / thank-you page** — `render_thankyou_downloads`
+  (hook `woocommerce_thankyou`). Guest-capable; links carry a **signed token**
+  (see UC-7) instead of a nonce.
+- **Email links** — signed tokens, delivered by the email in UC-7.
 
 Single-file product: one "Download: &lt;product&gt;" button per watermarked item.
-Multi-file product: one "Download: &lt;product&gt; — &lt;stem&gt;" button per watermarked
-master file (chapter/part).
+Multi-file product: one "Download: &lt;product&gt; — &lt;stem&gt;" button per master
+file (chapter/part).
+
+`handle_download` resolves the master key for the requested `part` with this
+precedence so a link works even before `process_order` has populated item meta
+(the file is minted on demand because `/watermark` is idempotent):
+
+> item `_audio_wm_master_keys` → legacy item `_audio_wm_master_key` →
+> product `_audio_wm_s3_keys` → legacy product `_audio_wm_s3_key`.
 
 ```mermaid
 sequenceDiagram
     autonumber
     actor Buyer
-    participant Page as Order details (My Account)
-    participant DH as wp_ajax_audio_wm_download
+    participant Page as My Account / thank-you / email
+    participant DH as audio_wm_download (priv + nopriv)
     participant API as POST /watermark
     participant S3
 
-    Page->>Page: add_download_buttons() reads _audio_wm_master_keys JSON
-    Page->>Page: renders 1 button per watermarked key (labelled with stem when multi)
-    Buyer->>DH: click "Download: <product> [— <part>]" (order_id, item_id[, part], nonce)
-    DH->>DH: nonce + ownership + $order->get_item(item_id) + resolve master_key for part
+    Page->>Page: renders 1 button per master key (labelled with stem when multi)
+    Note over Page: My Account → nonce · thank-you/email → signed token
+    Buyer->>DH: click "Download: <product> [— <part>]" (order_id, item_id[, part], auth)
+    DH->>DH: verify nonce+ownership OR signed token (order-key HMAC, not expired)
+    DH->>DH: $order->get_item(item_id) + resolve master_key (fallback chain)
     DH->>API: POST {master_key, order_id, item_id[, part]} (idempotent)
     API-->>DH: { download_url } (fresh presigned GET, 1h, named <stem>_order<id>.mp3)
     DH->>DH: validate host endsWith .amazonaws.com && https
@@ -163,8 +190,12 @@ sequenceDiagram
 **Post:** buyer receives the watermarked MP3 via a 1-hour presigned URL minted
 fresh on each click. Browser saves it as `<stem>_order<order_id>.mp3` (meaningful
 filename via `Content-Disposition`). **Errors:** failed nonce/ownership/item-check
-→ `wp_die` with 403/404/400; bad/missing/`non-amazonaws` URL → 502/503 `wp_die`;
-invalid `part` → 400/404.
+or bad signature → `wp_die` with 403/404/400; expired signed token → the friendly
+"link expired" page with a resend button (UC-7); bad/missing/`non-amazonaws` URL
+→ 502/503 `wp_die`; invalid `part` → 400/404.
+
+> The signed-token download AJAX is registered for both logged-in and guest
+> visitors (`wp_ajax_audio_wm_download` + `wp_ajax_nopriv_audio_wm_download`).
 
 ---
 
@@ -181,6 +212,69 @@ notices nothing beyond a slightly slower first click.
 **Post:** copy re-created; fresh URL returned. **Pre-req for this to work:** the
 master still exists under `masters/` and the stored `_audio_wm_master_keys` still
 lists it (see Gap G3).
+
+---
+
+## UC-7 — Guest email delivery + expired-link self-service re-request
+
+**Actor:** Buyer (guest — no WP login) · **Pre:** order reaches processing or
+completed; ≥1 eligible item.
+
+Because customers check out as guests, delivery cannot rely on My Account. When
+the order hits processing/completed, the WooCommerce email class
+`Audio_WM_Email_Download` (`includes/class-email-download.php`, registered via the
+`woocommerce_email_classes` filter) emails the buyer:
+
+- one **signed, time-limited download link per audio file/part**, and
+- a durable **"request a new link"** link.
+
+It appears under **WooCommerce → Settings → Emails**, so an admin can edit its
+subject/heading and enable/disable it. It sends **at most once automatically per
+order** — guarded by the `_audio_wm_email_sent` order meta — so a
+processing→completed transition does not double-email.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant WC as order processing/completed
+    participant EM as Audio_WM_Email_Download
+    actor Buyer
+    participant RS as audio_wm_resend (priv + nopriv)
+
+    WC->>EM: if not _audio_wm_email_sent → send delivery email
+    EM->>EM: per part, sign "dl|order|item|part|expires" (order-key HMAC)
+    EM->>EM: sign "resend|order" for the durable re-request link
+    EM-->>Buyer: email with N download links + 1 "request a new link" link
+    EM->>EM: set _audio_wm_email_sent = now
+
+    Note over Buyer: 30 days later a download link has expired
+    Buyer->>Buyer: click expired link → "link expired" page + resend button
+    Buyer->>RS: click resend (order_id, sig)
+    RS->>RS: verify "resend|order" HMAC; throttle: ≤1/hour (_audio_wm_last_resend)
+    RS->>EM: re-send delivery email with fresh 30-day links
+    RS-->>Buyer: "check your inbox" (email goes only to the order's address)
+```
+
+**Token scheme.** Links are authenticated with an HMAC signature over the
+WooCommerce **order key** (`$order->get_order_key()`) — not a WP nonce (nonces
+don't survive in email) and not login. The raw order key never appears in any
+URL; only the signature does. Signatures are checked with `hash_equals()`.
+
+- Download link signs `"dl|{order_id}|{item_id}|{part}|{expires}"`; URL params
+  `action=audio_wm_download&order_id&item_id&part&expires&sig`.
+- Resend link signs `"resend|{order_id}"`; URL params
+  `action=audio_wm_resend&order_id&sig`.
+
+**Expiry & throttle.** Download links **expire after 30 days**
+(`LINK_TTL = 30 * DAY_IN_SECONDS`), matching the S3 `ExpireBuyerCopies` lifecycle.
+An expired link shows a friendly "link expired" page with the resend button.
+Resend is **throttled to once per hour per order** (`RESEND_THROTTLE =
+HOUR_IN_SECONDS`, tracked in `_audio_wm_last_resend`) and only ever emails the
+address stored on the order.
+
+**Post:** guest buyer receives working download links by email and can self-serve
+fresh links after expiry, with no login and no staff involvement. **Errors:** bad
+signature → 403; throttled resend → "please wait" message; otherwise as UC-4.
 
 ---
 
@@ -271,10 +365,16 @@ By design (memory-bounded embed), the mark lives in the opening ~12 s. Trimming
 the start removes it. Tiling the mark across the whole book is a stronger but
 heavier follow-up; out of scope today.
 
-### G6 — Only `woocommerce_order_status_completed` triggers watermarking
-Shops that deliver downloads on **processing** (e.g. before manual completion)
-get no watermark/button until the order is marked completed. If that workflow is
-desired, also hook `woocommerce_order_status_processing` (or make it configurable).
+### G6 — ✅ RESOLVED — Watermarking now triggers on processing *and* completed
+*Was:* only `woocommerce_order_status_completed` was hooked, so shops that deliver
+downloads on **processing** (e.g. digital goods that may never be manually marked
+completed) got no watermark/button.
+
+*Fix:* `process_order` is now hooked on **both**
+`woocommerce_order_status_processing` and `woocommerce_order_status_completed`
+(`class-order-handler.php`). The per-key idempotency guard makes the second event
+a no-op, and the delivery email is guarded by `_audio_wm_email_sent` so the
+processing→completed transition does not double-email (UC-7).
 
 ### G7 — Stale top-level docs (not the code)
 `README.md` and `docs/DEPLOYMENT.md` still describe the pre-Phase-5 design: SES
@@ -294,14 +394,16 @@ plugin are current; these two guides need rewriting.
 | Upload single master (UC-2) | ✅ implemented |
 | Upload multiple masters (chapters/parts) per product | ✅ implemented |
 | Mixed catalog — non-audio products ignored | ✅ automatic (no `_audio_wm_enabled`) |
-| Watermark on completion — single-file product | ✅ implemented |
-| Watermark on completion — multi-file product (N parts) | ✅ implemented (per-part keys) |
-| Watermark on completion — multi-title order | ✅ fixed (per-item key, was G1) |
-| Buyer download — single-file (UC-4) | ✅ implemented |
+| Watermark on processing/completed — single-file product | ✅ implemented |
+| Watermark on processing/completed — multi-file product (N parts) | ✅ implemented (per-part keys) |
+| Watermark on processing/completed — multi-title order | ✅ fixed (per-item key, was G1) |
+| Buyer download — logged-in My Account (nonce, UC-4) | ✅ implemented |
+| Buyer download — guest thank-you page + email (signed token, UC-4/UC-7) | ✅ implemented |
 | Buyer download — multi-file (N buttons per item) | ✅ implemented |
+| Guest email delivery + expired-link self-service re-request (UC-7) | ✅ implemented (order-key HMAC, 30-day links, hourly-throttled resend) |
 | Re-download after expiry (UC-5) | ✅ implemented |
 | Forensic trace (UC-6) | ✅ implemented (per-order granularity, G4) |
 | Failure visibility to staff + per-key retry (G2) | ✅ order notes + Action Scheduler retry |
 | Master change/delete safety (G3) | ⚠️ partial |
 | Trim resistance (G5) | ❌ by design |
-| Non-completed delivery workflows (G6) | ❌ not implemented |
+| Watermark on processing (not just completed) (G6) | ✅ implemented |

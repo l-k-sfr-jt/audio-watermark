@@ -74,12 +74,13 @@ class Audio_WM_Product_Panel {
             </ul>
 
             <button type="button" id="audio-wm-upload-btn" class="button">
-                <?php esc_html_e( 'Add master audio file', 'audio-watermark-woo' ); ?>
+                <?php esc_html_e( 'Add master audio files', 'audio-watermark-woo' ); ?>
             </button>
 
             <input type="file"
                    id="audio-wm-file"
                    accept="audio/*"
+                   multiple
                    style="display:none">
 
             <span id="audio-wm-upload-status" style="display:block;margin-top:6px;"></span>

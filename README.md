@@ -7,8 +7,8 @@ ID from any copy — even after MP3 re-encoding down to 64 kbps.
 
 **Current phase:** Phase 5 — deployable AWS service (S3 + Lambda + API Gateway,
 behind an API key) plus a WooCommerce plugin that uploads masters, watermarks on
-order completion, and serves self-renewing buyer downloads. No SES — WordPress
-handles all customer email.
+order **processing/completion**, emails guests their download links, and serves
+self-renewing buyer downloads. No SES — WordPress sends all customer email.
 
 **[docs/SETUP.md](docs/SETUP.md)** is the end-to-end setup guide: AWS deploy →
 plugin install → product configuration → first test order → day-to-day ops.
@@ -21,21 +21,26 @@ API contract, data model, security) and **[docs/USE-CASES.md](docs/USE-CASES.md)
 ## How it works (one paragraph)
 
 The admin uploads one or more audiobook master files from the WooCommerce product
-screen (chapters, parts, CDs — one file per upload click); each browser PUTs
-directly to S3 under `masters/` via a presigned URL (no AWS keys in WordPress).
-Non-audio products (PDFs, physical goods) are automatically ignored. When an
-order completes, the plugin calls the service once per master file per eligible
-line item, embedding the order ID in each part and storing the buyer copies under
-`orders/<order_id>/<item_id>/` (or `/<item_id>.mp3` for single-file products).
-The customer sees one download button per part, each minted fresh on every click
-(1-hour presigned URL). Stored copies auto-expire after 30 days and are
+screen (chapters, parts, CDs — select one or more files per upload); each browser
+PUTs directly to S3 under `masters/` via a presigned URL (no AWS keys in
+WordPress). Non-audio products (PDFs, physical goods) are automatically ignored.
+When an order reaches **processing or completed**, the plugin calls the service
+once per master file per eligible line item, embedding the order ID in each part
+and storing the buyer copies under `orders/<order_id>/<item_id>/` (or
+`/<item_id>.mp3` for single-file products). The buyer — even a guest with no WP
+login — gets a delivery email with one download link per part plus a "request a
+new link" link, and the same buttons on the order-received/thank-you page (logged-
+in buyers also see them in My Account). Each click mints a fresh 1-hour presigned
+URL. Email/thank-you links are signed with an order-key HMAC and expire after 30
+days, matching the S3 lifecycle; an expired link self-serves a fresh one (resend
+throttled to once per hour). Stored copies auto-expire after 30 days and are
 re-created transparently from the master on the next download. To trace a leak,
 run `cli.py detect` on the file; the recovered code is the order ID.
 
 ```
 ADMIN ── upload masters (1–N) ──▶ S3 masters/<product_id>/<file>
-ORDER completed ── POST /watermark (per part) ──▶ embed order_id → MP3 → S3 orders/<order_id>/<item_id>/<part>.mp3
-BUYER ── download (one button per part) ──▶ fresh presigned GET
+ORDER processing/completed ── POST /watermark (per part) ──▶ embed order_id → MP3 → S3 orders/<order_id>/<item_id>/<part>.mp3
+BUYER ── email link / thank-you page / My Account (one per part) ──▶ fresh presigned GET
 LEAK ── cli.py detect ──▶ order_id ──▶ WooCommerce order ──▶ buyer
 ```
 
@@ -152,9 +157,11 @@ defaults to **eu-central-1**.
 ## WooCommerce plugin
 
 In `wordpress/audio-watermark-woo/`. Declares HPOS compatibility; provides a
-settings tab (API URL + key), a product panel (enable checkbox + master upload),
-order-completion watermarking, and per-item self-renewing download buttons on
-the customer's order page. See [docs/USE-CASES.md](docs/USE-CASES.md) for the
+settings tab (API URL + key), a product panel (enable checkbox + multi-file
+master upload), watermarking on order processing/completion, a guest delivery
+email (configurable under WooCommerce → Settings → Emails) with expiring signed
+download links, and per-item self-renewing download buttons on the thank-you page
+and the customer's order page. See [docs/USE-CASES.md](docs/USE-CASES.md) for the
 end-to-end flows.
 
 ---

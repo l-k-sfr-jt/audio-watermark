@@ -3,7 +3,7 @@
  * Plugin Name: Audio Watermark for WooCommerce
  * Plugin URI:  https://github.com/your-org/audio-watermark
  * Description: Embeds a unique forensic watermark (buyer's order ID) into audiobook WAV files so leaked copies can be traced back to the buyer.
- * Version:     1.0.0
+ * Version:     1.1.0
  * Author:      Audio Watermark
  * Requires at least: 5.8
  * Requires PHP: 7.4
@@ -14,7 +14,7 @@
 
 defined( 'ABSPATH' ) || exit;
 
-define( 'AUDIO_WM_VERSION',    '1.0.0' );
+define( 'AUDIO_WM_VERSION',    '1.1.0' );
 define( 'AUDIO_WM_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'AUDIO_WM_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
 
@@ -55,4 +55,18 @@ add_action( 'plugins_loaded', function () {
     new Audio_WM_Product_Panel();
     new Audio_WM_Order_Handler();
     new Audio_WM_Download_Handler();
+} );
+
+/**
+ * Register our custom WC_Email so it appears under WooCommerce > Settings > Emails
+ * and so WooCommerce loads it (its constructor wires the send-on-order hooks).
+ *
+ * The class file is required here (not in plugins_loaded above) because the
+ * woocommerce_email_classes filter passes the WC_Email base class, which only
+ * exists once WooCommerce has booted its mailer.
+ */
+add_filter( 'woocommerce_email_classes', function ( array $emails ): array {
+    require_once AUDIO_WM_PLUGIN_DIR . 'includes/class-email-download.php';
+    $emails['Audio_WM_Email_Download'] = new Audio_WM_Email_Download();
+    return $emails;
 } );

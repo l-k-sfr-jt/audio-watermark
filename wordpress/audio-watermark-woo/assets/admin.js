@@ -53,9 +53,9 @@
             statusDiv.style.color = color || '';
         }
 
-        function setBusy( disabled ) {
+        function setBusy( disabled, label ) {
             uploadBtn.disabled    = disabled;
-            uploadBtn.textContent = disabled ? 'Uploading…' : 'Add master audio file';
+            uploadBtn.textContent = disabled ? ( label || 'Uploading…' ) : 'Add master audio files';
         }
 
         /** Read the current list of S3 keys from the hidden input. */
@@ -113,19 +113,15 @@
             fileInput.click();
         } );
 
-        // ── Step 2 → 5: file selected → full upload flow ─────────────────────
+        // ── Step 2 → 5: files selected → upload each one sequentially ────────
 
-        fileInput.addEventListener( 'change', function () {
-            var file = fileInput.files && fileInput.files[0];
-            if ( ! file ) {
-                return;
-            }
-
-            setBusy( true );
-            setStatus( 'Requesting upload URL…', '#666' );
-
-            // ── Step 3: Ask WordPress/PHP for a presigned PUT URL ─────────────
-
+        /**
+         * Upload a single File through the two-step flow:
+         *   1. AJAX → PHP → presigned PUT URL + s3_key
+         *   2. fetch PUT → S3
+         * Resolves on success; rejects with an Error on any failure.
+         */
+        function uploadOne( file ) {
             var formData = new FormData();
             formData.append( 'action',       'audio_wm_get_upload_url' );
             formData.append( 'nonce',        nonce );
@@ -133,62 +129,86 @@
             formData.append( 'filename',     file.name );
             formData.append( 'content_type', file.type || 'application/octet-stream' );
 
-            fetch( ajaxUrl, {
-                method: 'POST',
-                body:   formData,
-            } )
-            .then( function ( response ) {
-                if ( ! response.ok ) {
-                    return Promise.reject( new Error( 'WordPress AJAX error: ' + response.status ) );
-                }
-                return response.json();
-            } )
-            .then( function ( data ) {
-                if ( ! data.success ) {
-                    var msg = ( data.data && data.data.message )
-                        ? data.data.message
-                        : 'Unknown error from server.';
-                    return Promise.reject( new Error( msg ) );
-                }
-
-                var uploadUrl = data.data.upload_url;
-                var s3Key     = data.data.s3_key;
-
-                if ( ! uploadUrl || ! s3Key ) {
-                    return Promise.reject( new Error( 'Server returned an incomplete response.' ) );
-                }
-
-                setStatus( 'Uploading file to S3…', '#666' );
-
-                // ── Step 4: PUT file directly to S3 via presigned URL ─────────
-
-                return fetch( uploadUrl, {
-                    method:  'PUT',
-                    headers: { 'Content-Type': file.type || 'application/octet-stream' },
-                    body:    file,
+            return fetch( ajaxUrl, { method: 'POST', body: formData } )
+                .then( function ( response ) {
+                    if ( ! response.ok ) {
+                        return Promise.reject( new Error( 'WordPress AJAX error: ' + response.status ) );
+                    }
+                    return response.json();
                 } )
-                .then( function ( s3Response ) {
-                    if ( ! s3Response.ok ) {
-                        return Promise.reject(
-                            new Error( 'S3 upload failed with status ' + s3Response.status )
-                        );
+                .then( function ( data ) {
+                    if ( ! data.success ) {
+                        var msg = ( data.data && data.data.message )
+                            ? data.data.message
+                            : 'Unknown error from server.';
+                        return Promise.reject( new Error( msg ) );
                     }
-                    // ── Step 5: Append key to list; prompt to save ────────────
-                    var keys = getKeys();
-                    if ( keys.indexOf( s3Key ) === -1 ) {
-                        keys.push( s3Key );
-                        setKeys( keys );
-                        addFileRow( s3Key );
+
+                    var uploadUrl = data.data.upload_url;
+                    var s3Key     = data.data.s3_key;
+
+                    if ( ! uploadUrl || ! s3Key ) {
+                        return Promise.reject( new Error( 'Server returned an incomplete response.' ) );
                     }
-                    setStatus( '✔ Upload complete! Save the product to persist.', 'green' );
+
+                    return fetch( uploadUrl, {
+                        method:  'PUT',
+                        headers: { 'Content-Type': file.type || 'application/octet-stream' },
+                        body:    file,
+                    } )
+                    .then( function ( s3Response ) {
+                        if ( ! s3Response.ok ) {
+                            return Promise.reject(
+                                new Error( 'S3 upload failed with status ' + s3Response.status )
+                            );
+                        }
+                        // Append key to the hidden list + visible row (dedup).
+                        var keys = getKeys();
+                        if ( keys.indexOf( s3Key ) === -1 ) {
+                            keys.push( s3Key );
+                            setKeys( keys );
+                            addFileRow( s3Key );
+                        }
+                    } );
                 } );
-            } )
-            .catch( function ( error ) {
-                setStatus( '✖ ' + ( error.message || 'Upload failed.' ), '#c00' );
-            } )
-            .finally( function () {
+        }
+
+        fileInput.addEventListener( 'change', function () {
+            var files = fileInput.files ? Array.prototype.slice.call( fileInput.files ) : [];
+            if ( ! files.length ) {
+                return;
+            }
+
+            var total  = files.length;
+            var done    = 0;
+            var failed  = 0;
+
+            setBusy( true, 'Uploading…' );
+
+            // Upload sequentially so the status reads "N of M" and we never fire
+            // dozens of presign + PUT requests at once for large (40-file) books.
+            var chain = Promise.resolve();
+            files.forEach( function ( file ) {
+                chain = chain.then( function () {
+                    setStatus( 'Uploading ' + ( done + failed + 1 ) + ' of ' + total + ': ' + file.name + '…', '#666' );
+                    setBusy( true, 'Uploading ' + ( done + failed + 1 ) + ' of ' + total + '…' );
+                    return uploadOne( file )
+                        .then( function () { done++; } )
+                        .catch( function ( error ) {
+                            failed++;
+                            setStatus( '✖ ' + file.name + ': ' + ( error.message || 'Upload failed.' ), '#c00' );
+                        } );
+                } );
+            } );
+
+            chain.finally( function () {
                 setBusy( false );
                 fileInput.value = '';
+                if ( failed === 0 ) {
+                    setStatus( '✔ Uploaded ' + done + ' file(s)! Save the product to persist.', 'green' );
+                } else {
+                    setStatus( '⚠ Uploaded ' + done + ' of ' + total + ' (' + failed + ' failed). Save the product to persist the successful ones.', '#c60' );
+                }
             } );
         } );
     } );

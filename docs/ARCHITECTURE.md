@@ -19,7 +19,8 @@ flowchart TB
         SET["Audio_WM_Settings\n(WC Settings → Audiobook WM)\napi_url + api_key"]
         PP["Audio_WM_Product_Panel\nproduct edit screen + upload AJAX"]
         OH["Audio_WM_Order_Handler\non order completed"]
-        DH["Audio_WM_Download_Handler\nMy Account download button + AJAX"]
+        DH["Audio_WM_Download_Handler\nMy Account + thank-you buttons + AJAX"]
+        EM["Audio_WM_Email_Download\nguest delivery email (signed links)"]
         JS["assets/admin.js\nbrowser upload driver"]
     end
 
@@ -38,6 +39,8 @@ flowchart TB
     PP -->|"wp_ajax: get presigned PUT"| APIGW
     JS -->|"PUT file (presigned)"| S3
     BUYER --> DH
+    EM -->|"signed download links"| BUYER
+    BUYER -->|"click email/thank-you link"| DH
     OH -->|"POST /watermark"| APIGW
     DH -->|"POST /watermark"| APIGW
     APIGW --> L
@@ -55,9 +58,10 @@ flowchart TB
 | Infra | `template.yaml` | S3 bucket, Lambda, API Gateway, API key, usage plan. |
 | WC settings | `wordpress/.../class-settings.php` | Stores `audio_wm_api_url`, `audio_wm_api_key`. |
 | WC product panel | `wordpress/.../class-product-panel.php` | Enable checkbox, S3 key field, upload button + AJAX proxy. |
-| WC order handler | `wordpress/.../class-order-handler.php` | On `woocommerce_order_status_completed`, watermark each enabled item. |
-| WC download handler | `wordpress/.../class-download-handler.php` | Per-item download buttons + ownership-checked AJAX redirect. |
-| Upload JS | `wordpress/.../assets/admin.js` | Drives browser → presigned-PUT upload. |
+| WC order handler | `wordpress/.../class-order-handler.php` | On `woocommerce_order_status_processing` **and** `_completed`, watermark each enabled item. |
+| WC download handler | `wordpress/.../class-download-handler.php` | Download buttons (My Account nonce + thank-you/email signed token) + AJAX redirect; order-key HMAC verify; product-key fallback. |
+| WC delivery email | `wordpress/.../includes/class-email-download.php` | `Audio_WM_Email_Download` WC email class — guest delivery email with per-part download links + a "request a new link" link. Templates in `templates/emails/`. |
+| Upload JS | `wordpress/.../assets/admin.js` | Drives browser → presigned-PUT upload (multi-file: uploads all selected files sequentially). |
 
 ---
 
@@ -154,6 +158,8 @@ the binary through WordPress.
 | **Order item** meta | `_audio_wm_master_keys` | Order handler | JSON array of master keys successfully watermarked for this item; falls back to `_audio_wm_master_key` (legacy) |
 | **Order item** meta | `_audio_wm_master_key` | Legacy (kept for back-compat reads) | Original single watermarked master key |
 | Order meta | `_watermark_code` | Order handler | `= order_id`; flags "≥1 item watermarked" |
+| Order meta | `_audio_wm_email_sent` | Email class | Timestamp of the automatic delivery email; guards against double-emailing on processing→completed |
+| Order meta | `_audio_wm_last_resend` | Resend handler | Timestamp of the last resend; throttles re-requests to once per hour |
 
 > **Mixed catalog:** Products without `_audio_wm_enabled=yes` (e.g. PDF books,
 > physical goods) are skipped transparently by the order handler and download
@@ -164,6 +170,13 @@ the binary through WordPress.
 > value (sanitized filename stem of the master) distinguishes per-chapter copies
 > within one item's S3 prefix. Per-item meta uses a JSON array so the order handler
 > can retry individual missing parts without re-watermarking already-done ones.
+
+> **Product-key fallback (on-demand minting):** the download handler and button
+> renderers resolve master keys with the precedence item `_audio_wm_master_keys`
+> → legacy item `_audio_wm_master_key` → product `_audio_wm_s3_keys` → legacy
+> product `_audio_wm_s3_key`. Because `/watermark` is idempotent, a link works and
+> mints the file on demand even before `process_order` has populated item meta —
+> so there is no "is being prepared" pending state.
 
 ---
 
@@ -178,14 +191,19 @@ the binary through WordPress.
 | `woocommerce_process_product_meta` | `Product_Panel::save_fields` | Persist product fields |
 | `admin_enqueue_scripts` | `Product_Panel::enqueue_scripts` | Load `admin.js` on product screens only |
 | `wp_ajax_audio_wm_get_upload_url` | `Product_Panel::ajax_get_upload_url` | Proxy presigned-PUT request (key stays server-side) |
-| `woocommerce_order_status_completed` | `Order_Handler::process_order` | Watermark all enabled items |
-| `woocommerce_order_details_after_order_table` | `Download_Handler::add_download_buttons` | Render per-item download buttons |
-| `wp_ajax_audio_wm_download` | `Download_Handler::handle_download` | Ownership-checked redirect to fresh presigned GET |
+| `woocommerce_order_status_processing` | `Order_Handler::process_order` | Watermark all enabled items (digital goods often stop at "processing") |
+| `woocommerce_order_status_completed` | `Order_Handler::process_order` | Watermark all enabled items (idempotent — no-op if processing already ran) |
+| `woocommerce_email_classes` | bootstrap / plugin file | Register `Audio_WM_Email_Download` so it appears under WC → Settings → Emails |
+| `woocommerce_order_details_after_order_table` | `Download_Handler::add_download_buttons` | Render nonce-authenticated download buttons on the logged-in My Account order page |
+| `woocommerce_thankyou` | `Download_Handler::render_thankyou_downloads` | Render signed-token download buttons on the order-received page (guest-capable) |
+| `wp_ajax_audio_wm_download` / `wp_ajax_nopriv_audio_wm_download` | `Download_Handler::handle_download` | Redirect to fresh presigned GET; logged-in nonce **or** guest signed token |
+| `wp_ajax_audio_wm_resend` / `wp_ajax_nopriv_audio_wm_resend` | `Download_Handler` resend handler | Verify resend token, throttle, re-send the delivery email |
 
-> `woocommerce_order_details_after_order_table` renders on the order-details page
-> only. Because `add_download_buttons` returns early when `get_current_user_id()`
-> doesn't own the order, nothing leaks into WooCommerce HTML emails (no user is
-> logged in when WC renders an email).
+> The logged-in My Account button path (`add_download_buttons`) returns early when
+> `get_current_user_id()` doesn't own the order, so nothing leaks into WooCommerce
+> HTML order emails. Guest delivery instead uses the dedicated
+> `Audio_WM_Email_Download` class with signed-token links, and the thank-you page
+> renders the same signed-token buttons.
 
 ---
 
@@ -198,9 +216,24 @@ the binary through WordPress.
 - **Path confinement:** `/watermark` rejects any `master_key` not under
   `masters/`, so a caller cannot read `orders/` copies or arbitrary keys.
 - **Upload AJAX:** nonce (`audio_wm_upload_nonce`) + `current_user_can('edit_products')`.
-- **Download AJAX:** per-order nonce + buyer-ownership check + item-belongs-to-order
-  check (`$order->get_item($item_id)`) + open-redirect guard (URL host must end
-  with `.amazonaws.com` and scheme `https`).
+- **Download AJAX (two auth models):**
+  - *Logged-in My Account:* per-order nonce + buyer-ownership check.
+  - *Guest (thank-you page + email):* an HMAC signature over the WooCommerce
+    **order key** (`$order->get_order_key()`) — chosen because WP nonces don't
+    survive in email and the shop checks customers out as guests (no login). The
+    raw order key never appears in any URL; only the signature does, and it is
+    verified with `hash_equals()`.
+    - Download links sign `"dl|{order_id}|{item_id}|{part}|{expires}"` and
+      **expire after 30 days** (`LINK_TTL = 30 * DAY_IN_SECONDS`, matching the S3
+      `ExpireBuyerCopies` lifecycle); an expired link shows a "link expired" page
+      with a resend button.
+    - Resend links sign `"resend|{order_id}"` (durable — no expiry) and are
+      **throttled to once per hour per order** (`RESEND_THROTTLE = HOUR_IN_SECONDS`,
+      tracked in `_audio_wm_last_resend`); resend only ever emails the address on
+      the order.
+  - Both models also enforce the item-belongs-to-order check
+    (`$order->get_item($item_id)`) + open-redirect guard (URL host must end with
+    `.amazonaws.com` and scheme `https`).
 - **Least-privilege IAM:** Lambda gets only `s3:GetObject`/`PutObject` on
   `masters/*` + `orders/*` and `s3:HeadObject` on `orders/*` — no delete, no list.
 - **No long-lived AWS keys in WordPress:** browser PUTs via presigned URL; the
