@@ -1,0 +1,127 @@
+# Deploy the SAM stack (S3 + Lambda + API Gateway) to AWS.
+#
+# Authentication uses OIDC — GitHub exchanges a short-lived token for AWS
+# credentials via an IAM role. No long-lived AWS keys are stored in GitHub
+# Secrets. See docs/DEPLOYMENT.md → "GitHub Actions setup" for the one-time
+# IAM role + OIDC provider creation steps.
+#
+# Required GitHub Secret:
+#   AWS_ROLE_ARN   — ARN of the IAM role GitHub Actions will assume
+#                    e.g. arn:aws:iam::123456789012:role/AudioWatermarkDeploy
+#
+# Optional overrides (workflow_dispatch inputs, else env defaults apply):
+#   region         — AWS region          (default: eu-central-1)
+#   stack_name     — CloudFormation name (default: audio-watermark)
+
+name: Deploy to AWS
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      region:
+        description: AWS region
+        default: eu-central-1
+        required: false
+      stack_name:
+        description: CloudFormation stack name
+        default: audio-watermark
+        required: false
+
+# OIDC requires id-token: write so the runner can request a JWT from GitHub.
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ${{ inputs.region || 'eu-central-1' }}
+  STACK_NAME: ${{ inputs.stack_name || 'audio-watermark' }}
+
+jobs:
+  deploy:
+    name: Build & Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Exchange the GitHub OIDC JWT for short-lived AWS credentials.
+      # The role's trust policy must allow the token.actions.githubusercontent.com
+      # provider for this repository and branch (see docs/DEPLOYMENT.md).
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # SAM CLI is installed via the official action (faster than pip install).
+      - name: Set up AWS SAM CLI
+        uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      # Docker is required to build the container-image Lambda. The ubuntu-latest
+      # runner has Docker pre-installed; Buildx ensures multi-platform support.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # sam build uses the Dockerfile to compile the container image locally.
+      # Cached + parallel build flags come from samconfig.toml [ci] profile.
+      - name: Build container image
+        run: sam build --config-env ci
+
+      # Non-interactive deploy: --no-confirm-changeset skips the "Deploy this
+      # changeset?" prompt that would hang CI. The ci profile in samconfig.toml
+      # also sets confirm_changeset = false as a belt-and-suspenders measure.
+      # resolve_s3 and resolve_image_repos (set in samconfig.toml) auto-create
+      # the SAM artifact bucket and ECR repo on first deploy.
+      - name: Deploy stack
+        run: |
+          sam deploy \
+            --config-env ci \
+            --region "$AWS_REGION" \
+            --stack-name "$STACK_NAME" \
+            --no-confirm-changeset \
+            --no-disable-rollback
+
+      # Publish a summary to the GitHub Actions run page so the API URL is
+      # visible without digging through log lines. The actual API key value is
+      # NOT printed here — retrieve it with the aws CLI command shown below.
+      - name: Print stack outputs
+        if: success()
+        run: |
+          echo "## Deployment complete" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          AWS_OUTPUTS=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --region "$AWS_REGION" \
+            --query "Stacks[0].Outputs" \
+            --output json)
+
+          API_BASE=$(echo "$AWS_OUTPUTS" | \
+            python3 -c "import sys,json; o={x['OutputKey']:x['OutputValue'] for x in json.load(sys.stdin)}; print(o.get('ApiBaseUrl',''))")
+          API_KEY_ID=$(echo "$AWS_OUTPUTS" | \
+            python3 -c "import sys,json; o={x['OutputKey']:x['OutputValue'] for x in json.load(sys.stdin)}; print(o.get('ApiKeyId',''))")
+
+          echo "| Key | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-----|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| API base URL | \`$API_BASE\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Region | \`$AWS_REGION\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Stack | \`$STACK_NAME\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Configure these in WooCommerce → Settings → Audiobook WM." >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Retrieve the API key value:" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`\`\`bash" >> "$GITHUB_STEP_SUMMARY"
+          echo "aws apigateway get-api-keys --include-values \\" >> "$GITHUB_STEP_SUMMARY"
+          echo "  --query \"items[?id=='${API_KEY_ID}'].value\" \\" >> "$GITHUB_STEP_SUMMARY"
+          echo "  --output text --region $AWS_REGION" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"
+
+          # Echo to the log as well (key ID only, never the key value).
+          echo "API base URL : $API_BASE"
+          echo "API Key ID   : $API_KEY_ID"
+          echo "Next: ./scripts/smoke-test.sh path/to/audiobook.wav 123"

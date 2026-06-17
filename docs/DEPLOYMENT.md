@@ -139,6 +139,68 @@ audio**, save. Place a test order, mark it **completed**, and confirm a
 
 ---
 
+---
+
+## Deploying from GitHub Actions (alternative to local deploy)
+
+The repo ships a pre-built workflow at `.github/workflows/deploy.yml` that runs
+`sam build` + `sam deploy` on every push to `master`, or on manual trigger. It
+uses **OIDC** — GitHub requests a short-lived AWS token instead of storing
+long-lived access keys in Secrets.
+
+### One-time setup (browser + terminal)
+
+#### 1. Create the IAM OIDC identity provider
+
+In **IAM → Identity providers → Add provider**:
+- Provider type: **OpenID Connect**
+- Provider URL: `https://token.actions.githubusercontent.com`
+- Audience: `sts.amazonaws.com`
+
+> Do this once per AWS account — if it already exists, skip this step.
+
+#### 2. Create the deployment IAM role
+
+In **IAM → Roles → Create role**:
+- Trusted entity type: **Web identity**
+- Identity provider: `token.actions.githubusercontent.com`
+- Audience: `sts.amazonaws.com`
+- Add condition (so only *this* repo's `master` branch can assume the role):
+  ```
+  Condition key: token.actions.githubusercontent.com:sub
+  Operator:      StringLike
+  Value:         repo:l-k-sfr-jt/audio-watermark:ref:refs/heads/master
+  ```
+- Permissions: attach **AdministratorAccess** for now (scope down later — see
+  "Going to production" below).
+- Name the role e.g. `AudioWatermarkDeploy`.
+- Copy the **role ARN**: `arn:aws:iam::<account-id>:role/AudioWatermarkDeploy`.
+
+#### 3. Store the ARN in GitHub Secrets
+
+Repository → **Settings → Secrets and variables → Actions → New repository
+secret**:
+
+| Name | Value |
+|------|-------|
+| `AWS_ROLE_ARN` | `arn:aws:iam::<account-id>:role/AudioWatermarkDeploy` |
+
+#### 4. Push to master (or trigger manually)
+
+The workflow runs automatically on push to `master`. For a manual run:
+**Actions → Deploy to AWS → Run workflow** (region and stack name optional).
+
+The run summary shows the API base URL and a CLI command to retrieve the API key.
+
+### Local deploy still works
+
+`scripts/deploy.sh` is unchanged. Local and CI deploys use the same
+`samconfig.toml` (default profile for local, `ci` profile for GitHub Actions).
+Both produce the same CloudFormation stack — there's only ever one stack per
+region.
+
+---
+
 ## Going to production (later)
 
 - **Lock down IAM:** replace the `deployer` AdministratorAccess user with a

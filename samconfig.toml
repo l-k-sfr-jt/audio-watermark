@@ -14,3 +14,23 @@ confirm_changeset = true
 resolve_s3 = true
 resolve_image_repos = true   # auto-create/manage the ECR repo for the container image
 disable_rollback = false     # allow CloudFormation to roll back on failure (default); override any local --guided setting
+
+# ---------------------------------------------------------------------------
+# CI profile — used by .github/workflows/deploy.yml via --config-env ci
+# Same settings as [default] except confirm_changeset = false so the deploy
+# never waits for interactive input in GitHub Actions.
+# ---------------------------------------------------------------------------
+[ci.global.parameters]
+stack_name = "audio-watermark"
+
+[ci.build.parameters]
+cached = true
+parallel = true
+
+[ci.deploy.parameters]
+region = "eu-central-1"
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = false
+resolve_s3 = true
+resolve_image_repos = true
+disable_rollback = false
