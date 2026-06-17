@@ -67,7 +67,15 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       PackageType: Image
-      MemorySize: 1024
+      # 2048 MB ≈ 1.2 vCPU — roughly doubles transcode speed vs 1024 so a
+      # full-length chapter finishes inside API Gateway's hard 29 s timeout.
+      MemorySize: 2048
+      # Default /tmp is 512 MB. Watermarking builds a full-length intermediate
+      # WAV (a ~45-min mono master ≈ 230 MB, stereo ≈ 470 MB) plus the source
+      # master and the output MP3 — which overflows 512 MB and makes ffmpeg fail
+      # with "No space left on device". 2 GB leaves comfortable headroom.
+      EphemeralStorage:
+        Size: 2048
       Timeout: 60
       Tracing: Active        # X-Ray — free tier 100 k traces/month; SAM adds the layer
       Architectures:
