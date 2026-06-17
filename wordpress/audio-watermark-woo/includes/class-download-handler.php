@@ -449,14 +449,24 @@ class Audio_WM_Download_Handler {
             }
             $result = Audio_WM_Order_Handler::call_service( '/watermark', $payload );
         } catch ( \Exception $e ) {
-            error_log( "[Audio WM] Download failed — order #{$order_id}, item #{$item_id}: " . $e->getMessage() );
-            wp_die( esc_html__( 'Could not generate download link. Please try again.', 'audio-watermark-woo' ), '', [ 'response' => 503 ] );
+            error_log( "[Audio WM] Download failed — order #{$order_id}, item #{$item_id}, master_key '{$master_key}': " . $e->getMessage() );
+            wp_die(
+                esc_html__( 'Could not generate download link. Please try again.', 'audio-watermark-woo' )
+                    . self::admin_debug_detail( $e->getMessage(), $master_key ),
+                '',
+                [ 'response' => 503 ]
+            );
             return;
         }
 
         if ( empty( $result['download_url'] ) ) {
             error_log( "[Audio WM] Download failed — order #{$order_id}, item #{$item_id}: service returned no download_url" );
-            wp_die( esc_html__( 'Could not generate download link. Please try again.', 'audio-watermark-woo' ), '', [ 'response' => 502 ] );
+            wp_die(
+                esc_html__( 'Could not generate download link. Please try again.', 'audio-watermark-woo' )
+                    . self::admin_debug_detail( 'Service returned no download_url.', $master_key ),
+                '',
+                [ 'response' => 502 ]
+            );
             return;
         }
 
@@ -568,6 +578,30 @@ class Audio_WM_Download_Handler {
             ),
             esc_html__( 'Link expired', 'audio-watermark-woo' ),
             [ 'response' => 410 ]
+        );
+    }
+
+    /**
+     * Return a diagnostic HTML fragment with the underlying error — but ONLY for
+     * users who can manage the shop. Regular customers see just the friendly
+     * message; admins/shop managers see the real reason inline so they don't have
+     * to dig through the debug log.
+     *
+     * @param string $detail     Underlying error message.
+     * @param string $master_key The master S3 key that was being processed.
+     * @return string
+     */
+    private static function admin_debug_detail( string $detail, string $master_key ): string {
+        if ( ! current_user_can( 'manage_woocommerce' ) ) {
+            return '';
+        }
+        return sprintf(
+            '<p style="margin-top:1em;padding:8px;background:#f6f7f7;border-left:4px solid #c00;font-family:monospace;font-size:13px;">'
+                . '<strong>%s</strong><br>%s<br><br><strong>%s</strong> <code>%s</code></p>',
+            esc_html__( 'Admin diagnostic (only you can see this):', 'audio-watermark-woo' ),
+            esc_html( $detail ),
+            esc_html__( 'master_key:', 'audio-watermark-woo' ),
+            esc_html( $master_key )
         );
     }
 
