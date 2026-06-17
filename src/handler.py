@@ -154,8 +154,20 @@ def route_watermark(event: dict) -> dict:
             item_id_raw = int(item_id_raw)
         if not isinstance(item_id_raw, int) or not (1 <= item_id_raw <= 2**63 - 1):
             return _error(400, "item_id, if provided, must be a positive integer (WooCommerce order-item ID)")
-        output_key = f"orders/{order_id}/{item_id_raw}.mp3"
+
+        # Optional `part` — a sanitized filename stem that namespaces per-file
+        # output within one item (multi-part audiobooks). Only valid with item_id.
+        part = str(body.get("part", "")).strip()
+        if part:
+            if not re.match(r"^[A-Za-z0-9._\-]+$", part) or len(part) > 128:
+                return _error(400, "part must contain only alphanumeric, dot, hyphen or underscore characters (max 128 chars)")
+            output_key = f"orders/{order_id}/{item_id_raw}/{part}.mp3"
+        else:
+            output_key = f"orders/{order_id}/{item_id_raw}.mp3"
     else:
+        part = str(body.get("part", "")).strip()
+        if part:
+            return _error(400, "part requires item_id to also be present")
         output_key = f"orders/{order_id}.mp3"
 
     # Derive a human-friendly filename from the master key so the browser saves

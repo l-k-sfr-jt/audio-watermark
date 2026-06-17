@@ -75,29 +75,51 @@ class Audio_WM_Download_Handler {
                 continue;
             }
 
-            $master_key = $item->get_meta( '_audio_wm_master_key' );
-            if ( $master_key ) {
-                // Item watermarked: show download button.
-                $download_url = add_query_arg(
-                    [
+            // Read the list of successfully watermarked master keys for this item.
+            // New format: JSON array in _audio_wm_master_keys.
+            // Falls back to legacy _audio_wm_master_key (single string).
+            $done_keys_json = $item->get_meta( '_audio_wm_master_keys' );
+            $done_keys      = $done_keys_json ? ( json_decode( $done_keys_json, true ) ?: [] ) : [];
+            if ( empty( $done_keys ) ) {
+                $legacy = $item->get_meta( '_audio_wm_master_key' );
+                if ( $legacy ) {
+                    $done_keys = [ $legacy ];
+                }
+            }
+
+            $multi = count( $done_keys ) > 1;
+
+            if ( ! empty( $done_keys ) ) {
+                foreach ( $done_keys as $done_key ) {
+                    $stem = pathinfo( basename( $done_key ), PATHINFO_FILENAME );
+                    $args = [
                         'action'   => 'audio_wm_download',
                         'order_id' => $order_id,
                         'item_id'  => $item_id,
                         '_wpnonce' => $nonce,
-                    ],
-                    admin_url( 'admin-ajax.php' )
-                );
-                $sections[] = sprintf(
-                    '<p><a href="%s" class="button" target="_blank">%s</a></p>',
-                    esc_url( $download_url ),
-                    esc_html(
-                        sprintf(
+                    ];
+                    if ( $multi ) {
+                        $args['part'] = $stem;
+                    }
+                    $download_url = add_query_arg( $args, admin_url( 'admin-ajax.php' ) );
+                    $label = $multi
+                        ? sprintf(
+                            /* translators: 1: product name, 2: file stem/part name */
+                            __( 'Download: %1$s — %2$s', 'audio-watermark-woo' ),
+                            $item->get_name(),
+                            $stem
+                          )
+                        : sprintf(
                             /* translators: %s: product name */
                             __( 'Download: %s', 'audio-watermark-woo' ),
                             $item->get_name()
-                        )
-                    )
-                );
+                          );
+                    $sections[] = sprintf(
+                        '<p><a href="%s" class="button" target="_blank">%s</a></p>',
+                        esc_url( $download_url ),
+                        esc_html( $label )
+                    );
+                }
             } else {
                 // Item not yet watermarked: let the customer know it's pending.
                 $sections[] = sprintf(
@@ -191,10 +213,64 @@ class Audio_WM_Download_Handler {
 
         // Load the item from the already-loaded order object; this simultaneously
         // confirms the item belongs to this order (get_item returns null otherwise).
-        $item       = $order->get_item( $item_id );
-        $master_key = ( $item instanceof WC_Order_Item_Product )
-            ? $item->get_meta( '_audio_wm_master_key' )
-            : '';
+        $item = $order->get_item( $item_id );
+        if ( ! ( $item instanceof WC_Order_Item_Product ) ) {
+            wp_die(
+                esc_html__( 'Invalid download request.', 'audio-watermark-woo' ),
+                '',
+                [ 'response' => 400 ]
+            );
+            return;
+        }
+
+        // Read the list of watermarked master keys for this item.
+        // New format: JSON array in _audio_wm_master_keys.
+        // Falls back to legacy _audio_wm_master_key (single string).
+        $done_keys_json = $item->get_meta( '_audio_wm_master_keys' );
+        $done_keys      = $done_keys_json ? ( json_decode( $done_keys_json, true ) ?: [] ) : [];
+        if ( empty( $done_keys ) ) {
+            $legacy = $item->get_meta( '_audio_wm_master_key' );
+            if ( $legacy ) {
+                $done_keys = [ $legacy ];
+            }
+        }
+
+        if ( empty( $done_keys ) ) {
+            wp_die(
+                esc_html__( 'Could not generate download link. Please contact support.', 'audio-watermark-woo' ),
+                '',
+                [ 'response' => 404 ]
+            );
+            return;
+        }
+
+        // Resolve which master key to serve.
+        // Multi-file: `part` in the query string is the sanitized filename stem;
+        // find the done key whose stem matches. Single-file: use the only key.
+        $part       = isset( $_GET['part'] ) ? sanitize_file_name( wp_unslash( $_GET['part'] ) ) : ''; // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- nonce already verified above
+        $master_key = '';
+
+        if ( $part ) {
+            if ( ! preg_match( '/^[A-Za-z0-9._\-]+$/', $part ) ) {
+                wp_die(
+                    esc_html__( 'Invalid download request.', 'audio-watermark-woo' ),
+                    '',
+                    [ 'response' => 400 ]
+                );
+                return;
+            }
+            foreach ( $done_keys as $dk ) {
+                $base = basename( $dk );
+                $dot  = strrpos( $base, '.' );
+                $stem = sanitize_file_name( false !== $dot ? substr( $base, 0, $dot ) : $base );
+                if ( $stem === $part ) {
+                    $master_key = $dk;
+                    break;
+                }
+            }
+        } else {
+            $master_key = $done_keys[0];
+        }
 
         if ( ! $master_key ) {
             wp_die(
@@ -207,14 +283,15 @@ class Audio_WM_Download_Handler {
 
         // ── Call watermark service (idempotent — returns a fresh presigned URL) ──
         try {
-            // Send the same item_id the order handler used so this resolves to
-            // the per-item copy (orders/<order_id>/<item_id>.mp3), not whichever
-            // title happened to be watermarked first in a multi-item order.
-            $result = Audio_WM_Order_Handler::call_service( '/watermark', [
+            $payload = [
                 'master_key' => $master_key,
                 'order_id'   => $order_id,
                 'item_id'    => $item_id,
-            ] );
+            ];
+            if ( $part ) {
+                $payload['part'] = $part;
+            }
+            $result = Audio_WM_Order_Handler::call_service( '/watermark', $payload );
         } catch ( \Exception $e ) {
             error_log( "[Audio WM] Download failed — order #{$order_id}, item #{$item_id}: " . $e->getMessage() );
             wp_die(

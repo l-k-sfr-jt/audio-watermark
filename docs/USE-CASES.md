@@ -31,9 +31,14 @@ fast with a clear message (`class-product-panel.php`, `class-order-handler.php`)
 
 ---
 
-## UC-2 — Admin uploads a master to the product library
+## UC-2 — Admin uploads master files to the product library
 
 **Actor:** Admin · **Pre:** UC-1 done; editing a product.
+
+One product can have **one or more master files** (chapters, CDs, parts). Each
+file is uploaded individually; the browser PUTs each one directly to S3. The
+product panel maintains a list — the admin clicks "Add master audio file" once per
+file and the list grows, each entry showing the filename with a "Remove" button.
 
 ```mermaid
 sequenceDiagram
@@ -45,8 +50,8 @@ sequenceDiagram
     participant API as POST /products/upload-url
     participant S3
 
-    Admin->>Panel: check "Enable watermarking", click "Upload master audio"
-    Panel->>JS: file chosen
+    Admin->>Panel: check "Enable watermarking", click "Add master audio file"
+    Panel->>JS: file chosen (repeat for each part)
     JS->>WP: POST {product_id, filename, content_type} (+nonce)
     WP->>WP: check nonce + current_user_can('edit_products')
     WP->>API: POST {product_id, filename, content_type} (x-api-key)
@@ -55,25 +60,31 @@ sequenceDiagram
     WP-->>JS: { upload_url, s3_key }
     JS->>S3: PUT file (direct, presigned)
     S3-->>JS: 200
-    JS->>Panel: fill _audio_wm_s3_key, prompt "Save product"
+    JS->>Panel: append s3_key to list + hidden JSON _audio_wm_s3_keys
     Admin->>Panel: Save product
-    Panel->>WP: woocommerce_process_product_meta → save _audio_wm_enabled, _audio_wm_s3_key
+    Panel->>WP: woocommerce_process_product_meta → save _audio_wm_enabled, _audio_wm_s3_keys (JSON array)
 ```
 
-**Post:** product has `_audio_wm_enabled=yes` and `_audio_wm_s3_key=masters/<id>/<file>`;
-the file is in S3 under `masters/`. **Errors:** nonce/permission → 403 JSON;
-service/S3 errors surface in the status line via `admin.js` (step 6 catch).
+**Post:** product has `_audio_wm_enabled=yes` and `_audio_wm_s3_keys` holding a
+JSON array of master S3 keys (e.g. `["masters/42/part-1.wav","masters/42/part-2.wav"]`);
+all files are in S3 under `masters/<product_id>/`. **Errors:** nonce/permission
+→ 403 JSON; service/S3 errors surface in the status line via `admin.js` (catch).
 
-> **Note:** the S3 key is only persisted when the admin clicks **Save product**
-> after the upload. Uploading and then leaving without saving stores the file in
-> S3 but loses the key reference (orphan master in `masters/`).
+> **Note:** S3 keys are only persisted when the admin clicks **Save product** after
+> uploading. Uploading and then leaving without saving stores the file in S3 but
+> loses the key reference (orphan master in `masters/`).
+
+> **Mixed catalog:** non-audio products (PDFs, physical goods) simply never have
+> `_audio_wm_enabled=yes`, so the order and download handlers ignore them
+> automatically. No per-product configuration is needed beyond leaving the checkbox
+> unchecked (the default).
 
 ---
 
 ## UC-3 — Order completed → watermark each eligible item
 
 **Actor:** Service (triggered by WooCommerce) · **Pre:** order reaches
-**completed**; ≥1 item's product has `_audio_wm_enabled=yes` + `_audio_wm_s3_key`.
+**completed**; ≥1 item's product has `_audio_wm_enabled=yes` + `_audio_wm_s3_keys`.
 
 ```mermaid
 sequenceDiagram
@@ -86,27 +97,37 @@ sequenceDiagram
 
     WC->>OH: order_id
     loop each line item (item_id)
-        OH->>OH: product enabled? has master key?
-        OH->>API: POST {master_key, order_id, item_id} (x-api-key)
-        alt orders/<order_id>/<item_id>.mp3 exists
-            API-->>OH: { download_url, from_cache:true }
-        else
-            API->>S3: download master
-            API->>WM: embed order_id → MP3 128k
-            API->>S3: put orders/<order_id>/<item_id>.mp3
-            API-->>OH: { download_url, watermark_code, from_cache:false }
+        OH->>OH: product enabled? get master keys list
+        loop each master_key in product keys
+            OH->>OH: already in _audio_wm_master_keys? → skip (idempotent)
+            Note over OH: part = stem(master_key) when multi-file, else ''
+            OH->>API: POST {master_key, order_id, item_id[, part]} (x-api-key)
+            alt output key exists in S3
+                API-->>OH: { download_url, from_cache:true }
+            else
+                API->>S3: download master
+                API->>WM: embed order_id → MP3 128k
+                API->>S3: put orders/<order_id>/<item_id>[/<part>].mp3
+                API-->>OH: { download_url, watermark_code, from_cache:false }
+            end
+            OH->>OH: append master_key to _audio_wm_master_keys JSON; $item->save()
         end
-        OH->>OH: $item->update_meta_data('_audio_wm_master_key', master_key); $item->save()
     end
     OH->>OH: if any watermarked → order._watermark_code = order_id
 ```
 
-**Post:** one copy per watermarked item at `orders/<order_id>/<item_id>.mp3`;
-each watermarked item has `_audio_wm_master_key`; order has `_watermark_code`.
-Each item is keyed by its own `item_id`, so different titles in the same order
-never collide (see G1, resolved). **Errors:** a failed service call is logged
-(`error_log`) and **does not block order completion**; that item simply gets no
-item meta and no download button (see Gap G2).
+**Post:** one S3 copy per watermarked master-per-item. Single-file product:
+`orders/<order_id>/<item_id>.mp3`. Multi-file product: one copy per part at
+`orders/<order_id>/<item_id>/<part>.mp3`. Each item's `_audio_wm_master_keys`
+accumulates successfully watermarked keys. Order has `_watermark_code`.
+
+Non-audio items (PDF books, physical goods) are skipped because their products
+lack `_audio_wm_enabled=yes` — no configuration needed.
+
+**Errors:** a failed service call is logged, an order note is added, and the key
+is **not** appended to `_audio_wm_master_keys`. Action Scheduler retries that
+specific key up to 3 times (+5 min / +30 min / +2 h) without re-watermarking
+already-done parts. Does not block order completion.
 
 ---
 
@@ -114,6 +135,10 @@ item meta and no download button (see Gap G2).
 
 **Actor:** Buyer · **Pre:** UC-3 set `_watermark_code` on the order; buyer is
 logged in and owns the order.
+
+Single-file product: one "Download: &lt;product&gt;" button per watermarked item.
+Multi-file product: one "Download: &lt;product&gt; — &lt;stem&gt;" button per watermarked
+master file (chapter/part).
 
 ```mermaid
 sequenceDiagram
@@ -124,34 +149,38 @@ sequenceDiagram
     participant API as POST /watermark
     participant S3
 
-    Page->>Page: add_download_buttons() renders 1 button per watermarked item
-    Buyer->>DH: click "Download: <product>" (order_id, item_id, nonce)
-    DH->>DH: nonce + ownership + $order->get_item(item_id) → master_key
-    DH->>API: POST {master_key, order_id, item_id} (idempotent)
-    API-->>DH: { download_url } (fresh presigned GET, 1h) for orders/<order_id>/<item_id>.mp3
+    Page->>Page: add_download_buttons() reads _audio_wm_master_keys JSON
+    Page->>Page: renders 1 button per watermarked key (labelled with stem when multi)
+    Buyer->>DH: click "Download: <product> [— <part>]" (order_id, item_id[, part], nonce)
+    DH->>DH: nonce + ownership + $order->get_item(item_id) + resolve master_key for part
+    DH->>API: POST {master_key, order_id, item_id[, part]} (idempotent)
+    API-->>DH: { download_url } (fresh presigned GET, 1h, named <stem>_order<id>.mp3)
     DH->>DH: validate host endsWith .amazonaws.com && https
     DH-->>Buyer: 302 → presigned GET
-    Buyer->>S3: GET file
+    Buyer->>S3: GET file (browser saves as <stem>_order<id>.mp3)
 ```
 
 **Post:** buyer receives the watermarked MP3 via a 1-hour presigned URL minted
-fresh on each click. **Errors:** failed nonce/ownership/item-check → `wp_die`
-with 403/404/400; bad/missing/`non-amazonaws` URL → 502/503 `wp_die`.
+fresh on each click. Browser saves it as `<stem>_order<order_id>.mp3` (meaningful
+filename via `Content-Disposition`). **Errors:** failed nonce/ownership/item-check
+→ `wp_die` with 403/404/400; bad/missing/`non-amazonaws` URL → 502/503 `wp_die`;
+invalid `part` → 400/404.
 
 ---
 
 ## UC-5 — Re-download after the 30-day copy expired
 
-**Actor:** Buyer · **Pre:** `orders/<order_id>.mp3` deleted by lifecycle rule.
+**Actor:** Buyer · **Pre:** `orders/<order_id>/<item_id>.mp3` (or the per-part
+variant) deleted by lifecycle rule.
 
 Identical to UC-4: `handle_download` calls `/watermark`; the object is gone, so
 the service takes the **slow path** and regenerates it deterministically from
-the master (same `order_id` → same watermark). The buyer notices nothing beyond
-a slightly slower first click.
+the master (same `order_id` + `part` → same watermark and output key). The buyer
+notices nothing beyond a slightly slower first click.
 
 **Post:** copy re-created; fresh URL returned. **Pre-req for this to work:** the
-master still exists under `masters/` and the stored `_audio_wm_master_key` still
-points to it (see Gap G3).
+master still exists under `masters/` and the stored `_audio_wm_master_keys` still
+lists it (see Gap G3).
 
 ---
 
@@ -205,7 +234,7 @@ download button and staff had no visibility.
 *Fix:* `class-order-handler.php` now adds a **WooCommerce order note** on every
 watermarking attempt (success or failure), visible to staff in WC Admin → Orders.
 On failure it uses **Action Scheduler** (ships with WooCommerce ≥ 3.5) to
-schedule automatic retries:
+schedule automatic retries per-key:
 
 | Attempt | Delay |
 |---------|-------|
@@ -214,17 +243,20 @@ schedule automatic retries:
 | Retry 3 | +2 h |
 
 Each retry attempt adds its own order note (success / failure / "manual action
-required" after all attempts exhausted). Items that are already watermarked
-(have `_audio_wm_master_key` set) are skipped so a double-fire of the
-completion hook does not queue duplicate retries.
+required" after all attempts exhausted). Individual master keys already present
+in `_audio_wm_master_keys` are skipped, so retries only re-process failed parts
+without duplicating already-watermarked ones.
 
 ### G3 — Master change / deletion after orders exist
-- Changing a product's `_audio_wm_s3_key` does **not** regenerate already-cached
-  `orders/<order_id>.mp3` copies until the 30-day expiry; existing orders keep
-  serving the old master (their `_audio_wm_master_key` was captured at order time).
+- Changing a product's `_audio_wm_s3_keys` list does **not** affect already-placed
+  orders; each order item's `_audio_wm_master_keys` was captured at order time, so
+  existing buyers keep downloading from the master(s) that were live when they ordered.
 - If a master under `masters/` is deleted, UC-5 regeneration fails with `404`
   after the buyer copy expires. Masters have no lifecycle rule, so this only
   happens on manual deletion — but nothing guards against it.
+- Removing a master from a product's list and saving does not immediately affect
+  any outstanding download buttons (the download handler resolves from the order
+  item's `_audio_wm_master_keys`, not the current product list).
 
 ### G4 — Forensic granularity is per-order, not per-title
 The embedded code is the order ID, so two leaked files from the same multi-item
@@ -259,13 +291,17 @@ plugin are current; these two guides need rewriting.
 | Use case | Status |
 |----------|--------|
 | Configure service (UC-1) | ✅ implemented |
-| Upload master (UC-2) | ✅ implemented (minor orphan-on-no-save note) |
-| Watermark on completion — single-item order (UC-3) | ✅ implemented |
-| Watermark on completion — multi-item order | ✅ fixed (per-item key, was G1) |
-| Buyer download (UC-4) | ✅ implemented (per item) |
+| Upload single master (UC-2) | ✅ implemented |
+| Upload multiple masters (chapters/parts) per product | ✅ implemented |
+| Mixed catalog — non-audio products ignored | ✅ automatic (no `_audio_wm_enabled`) |
+| Watermark on completion — single-file product | ✅ implemented |
+| Watermark on completion — multi-file product (N parts) | ✅ implemented (per-part keys) |
+| Watermark on completion — multi-title order | ✅ fixed (per-item key, was G1) |
+| Buyer download — single-file (UC-4) | ✅ implemented |
+| Buyer download — multi-file (N buttons per item) | ✅ implemented |
 | Re-download after expiry (UC-5) | ✅ implemented |
 | Forensic trace (UC-6) | ✅ implemented (per-order granularity, G4) |
-| Failure visibility to staff + retry (G2) | ✅ order notes + Action Scheduler retry |
+| Failure visibility to staff + per-key retry (G2) | ✅ order notes + Action Scheduler retry |
 | Master change/delete safety (G3) | ⚠️ partial |
 | Trim resistance (G5) | ❌ by design |
 | Non-completed delivery workflows (G6) | ❌ not implemented |

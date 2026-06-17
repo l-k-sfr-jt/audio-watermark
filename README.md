@@ -20,19 +20,22 @@ API contract, data model, security) and **[docs/USE-CASES.md](docs/USE-CASES.md)
 
 ## How it works (one paragraph)
 
-The admin uploads an audiobook master from the WooCommerce product screen; the
-browser PUTs it straight to S3 under `masters/` via a presigned URL (no AWS keys
-in WordPress). When an order completes, the plugin calls the service, which
-copies the master, embeds the order ID, transcodes to MP3 128 kbps, and stores
-the buyer copy at `orders/<order_id>.mp3`. Buyer downloads are minted fresh on
-every click (1-hour presigned URL), and the stored copy auto-expires after 30
-days — re-created on demand from the master if the buyer returns. To trace a
-leak, run `cli.py detect` on the file; the recovered code is the order ID.
+The admin uploads one or more audiobook master files from the WooCommerce product
+screen (chapters, parts, CDs — one file per upload click); each browser PUTs
+directly to S3 under `masters/` via a presigned URL (no AWS keys in WordPress).
+Non-audio products (PDFs, physical goods) are automatically ignored. When an
+order completes, the plugin calls the service once per master file per eligible
+line item, embedding the order ID in each part and storing the buyer copies under
+`orders/<order_id>/<item_id>/` (or `/<item_id>.mp3` for single-file products).
+The customer sees one download button per part, each minted fresh on every click
+(1-hour presigned URL). Stored copies auto-expire after 30 days and are
+re-created transparently from the master on the next download. To trace a leak,
+run `cli.py detect` on the file; the recovered code is the order ID.
 
 ```
-ADMIN ── upload master ──▶ S3 masters/<product_id>/<file>
-ORDER completed ── POST /watermark ──▶ embed order_id → MP3 → S3 orders/<order_id>.mp3
-BUYER ── download ──▶ fresh presigned GET (re-generated after 30-day expiry)
+ADMIN ── upload masters (1–N) ──▶ S3 masters/<product_id>/<file>
+ORDER completed ── POST /watermark (per part) ──▶ embed order_id → MP3 → S3 orders/<order_id>/<item_id>/<part>.mp3
+BUYER ── download (one button per part) ──▶ fresh presigned GET
 LEAK ── cli.py detect ──▶ order_id ──▶ WooCommerce order ──▶ buyer
 ```
 
@@ -111,7 +114,7 @@ wordpress/
 | Endpoint | Purpose |
 |----------|---------|
 | `POST /products/upload-url` | Returns a presigned S3 PUT (15 min) so a browser uploads a master directly. |
-| `POST /watermark` | Idempotent: watermark a master for an order ID and return a presigned GET (1 h). Serves both first purchase and re-download. |
+| `POST /watermark` | Idempotent: watermark one master for an order ID and return a presigned GET (1 h). Accepts optional `item_id` and `part` for per-chapter multi-file delivery. Serves both first purchase and re-download. |
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full request/response
 contract and validation rules.

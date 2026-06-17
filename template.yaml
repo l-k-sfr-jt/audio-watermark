@@ -44,6 +44,23 @@ Resources:
             Prefix: orders/
             NoncurrentVersionExpiration:
               NoncurrentDays: 1
+      # CORS is required so the WordPress admin page can PUT master audio files
+      # directly from the browser to the presigned S3 URL without going through
+      # WordPress (which would time out on large files). Only PUT on masters/ is
+      # needed; orders/ presigned GETs are fetched by the browser via redirect,
+      # not XHR, so no CORS rule is needed there.
+      # Add your WordPress domain(s) to AllowedOrigins. The wildcard below works
+      # during development; tighten to explicit origins in production if preferred.
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods:
+              - PUT
+            AllowedOrigins:
+              - "https://www.dobradetektivka.cz"
+              - "https://dobradetektivka.cz"
+            AllowedHeaders:
+              - "Content-Type"
+            MaxAge: 3000
 
   # ----- Compute ------------------------------------------------------------
   AudioWatermarkFunction:

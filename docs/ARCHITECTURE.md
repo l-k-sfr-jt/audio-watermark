@@ -87,25 +87,33 @@ Validation (`route_upload_url`):
 ### `POST /watermark` (idempotent)
 Request:
 ```json
-{ "master_key": "masters/123/audiobook.wav", "order_id": 456789, "item_id": 7 }
+{ "master_key": "masters/123/chapter-01.wav", "order_id": 456789, "item_id": 7, "part": "chapter-01" }
 ```
+`item_id` and `part` are optional (see output key table below).
+
 Response:
 ```json
 { "download_url": "https://s3...presigned-get", "watermark_code": 456789, "from_cache": false }
 ```
 
+The `download_url` is a presigned GET with `Content-Disposition: attachment; filename="<stem>_order<order_id>.mp3"` so the browser saves a meaningful filename.
+
 Validation (`route_watermark`):
 - `master_key` required, **must start with `masters/`**, must not contain `..` segments.
 - `order_id` must be an integer `1 … 2^32-1` (also the embedded 32-bit code).
 - `item_id` **optional**; if present must be a positive integer (WooCommerce
-  order-item ID). It only namespaces the stored copy — it is **not** part of the
+  order-item ID). It namespaces the stored copy — it is **not** part of the
   embedded code.
+- `part` **optional**; sanitized filename stem (e.g. `"chapter-01"`); only valid
+  when `item_id` is also present; must match `^[A-Za-z0-9._\-]+$`, max 128 chars.
 - Presigned GET expiry: **3600 s (1 h)**, signed with the Lambda execution role.
 
-Output key:
-- With `item_id` → `orders/<order_id>/<item_id>.mp3` (so two different titles in
-  one order never collide).
-- Without `item_id` → `orders/<order_id>.mp3` (single-item / web-console path).
+Output key (precedence):
+| Inputs | Output key |
+|--------|-----------|
+| `order_id` + `item_id` + `part` | `orders/<order_id>/<item_id>/<part>.mp3` |
+| `order_id` + `item_id` | `orders/<order_id>/<item_id>.mp3` |
+| `order_id` only | `orders/<order_id>.mp3` (single-item / web-console path) |
 
 Behaviour:
 - **Fast path** — if the target copy already exists (`object_exists`), return a
@@ -114,9 +122,9 @@ Behaviour:
   `transcode_to_mp3` (128 kbps) → upload to the output key → presign,
   `from_cache: false`.
 
-> The embedded watermark code is always `order_id`, independent of `item_id`, so
-> forensic tracing remains per-order (the buyer). Per-item keying only fixes
-> *delivery* so each title is served correctly.
+> The embedded watermark code is always `order_id`, independent of `item_id` and
+> `part`, so forensic tracing remains per-order (the buyer). Per-item and per-part
+> keying only fixes *delivery* so each title/chapter is served correctly.
 
 ---
 
@@ -125,12 +133,15 @@ Behaviour:
 ### S3 layout (`template.yaml`)
 | Prefix | Content | Lifecycle |
 |--------|---------|-----------|
-| `masters/<product_id>/<filename>` | Product master | Permanent (no rule) |
-| `orders/<order_id>/<item_id>.mp3` | Buyer copy, per line item (sent by the plugin) | 30-day expiry; non-current versions purged after 1 day |
+| `masters/<product_id>/<filename>` | Product master files (one or more per product) | Permanent (no rule) |
+| `orders/<order_id>/<item_id>/<part>.mp3` | Buyer copy, per chapter/part (multi-file product) | 30-day expiry; non-current versions purged after 1 day |
+| `orders/<order_id>/<item_id>.mp3` | Buyer copy, per line item (single-file product) | 30-day expiry |
 | `orders/<order_id>.mp3` | Buyer copy when no `item_id` is sent (single-item / web console) | 30-day expiry |
 
 Bucket hardening: all public access blocked, SSE-AES256 default encryption,
-versioning enabled.
+versioning enabled. CORS allows PUT from the configured WordPress domain so
+the browser can upload masters directly via presigned URL without routing
+the binary through WordPress.
 
 ### WordPress metadata
 | Storage | Key | Set by | Meaning |
@@ -138,12 +149,21 @@ versioning enabled.
 | `wp_options` | `audio_wm_api_url` | Settings page | API base URL |
 | `wp_options` | `audio_wm_api_key` | Settings page | `x-api-key` secret |
 | Product (post) meta | `_audio_wm_enabled` | Product panel | `'yes'`/`'no'` |
-| Product (post) meta | `_audio_wm_s3_key` | Product panel (after upload) | Master S3 key |
-| **Order item** meta | `_audio_wm_master_key` | Order handler | Master key for that line item (HPOS-safe `$item->update_meta_data` + `save`) |
+| Product (post) meta | `_audio_wm_s3_keys` | Product panel (after upload) | JSON array of master S3 keys; falls back to `_audio_wm_s3_key` (legacy single string) |
+| Product (post) meta | `_audio_wm_s3_key` | Legacy (kept for back-compat reads) | Original single master key |
+| **Order item** meta | `_audio_wm_master_keys` | Order handler | JSON array of master keys successfully watermarked for this item; falls back to `_audio_wm_master_key` (legacy) |
+| **Order item** meta | `_audio_wm_master_key` | Legacy (kept for back-compat reads) | Original single watermarked master key |
 | Order meta | `_watermark_code` | Order handler | `= order_id`; flags "≥1 item watermarked" |
 
-> Per-item meta (not order meta) is used deliberately so a multi-product order
-> tracks each title's master independently — see `class-order-handler.php`.
+> **Mixed catalog:** Products without `_audio_wm_enabled=yes` (e.g. PDF books,
+> physical goods) are skipped transparently by the order handler and download
+> handler — no configuration or filtering needed.
+
+> **Multi-file:** One product can have N master files (chapters/parts). Each is
+> watermarked separately and delivered as its own download button. The `part`
+> value (sanitized filename stem of the master) distinguishes per-chapter copies
+> within one item's S3 prefix. Per-item meta uses a JSON array so the order handler
+> can retry individual missing parts without re-watermarking already-done ones.
 
 ---
 

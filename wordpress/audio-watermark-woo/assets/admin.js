@@ -1,15 +1,17 @@
 /**
  * admin.js — Audio Watermark for WooCommerce
  *
- * Drives the "Upload master audio" button on the product edit page.
+ * Drives the multi-file master upload on the product edit page, and the
+ * "Test connection" button on the WooCommerce settings page.
  *
- * Flow:
+ * Upload flow (product edit page):
  *  1. User clicks #audio-wm-upload-btn  → hidden file input is clicked.
  *  2. User picks a file                 → onChange fires.
  *  3. AJAX POST to WordPress            → PHP calls watermark service → returns { upload_url, s3_key }.
  *  4. fetch() PUT to presigned S3 URL   → file goes directly to S3 (never through WordPress).
- *  5. On success: populate _audio_wm_s3_key input; show success message.
+ *  5. On success: append s3_key to the hidden JSON list; add a row to #audio-wm-files-list.
  *  6. On any error: show error message in #audio-wm-upload-status.
+ *  Remove: clicking "Remove" on a list row drops that key from the JSON and removes the row.
  *
  * Depends on `window.AudioWM` being localised by Audio_WM_Product_Panel::enqueue_scripts():
  *   { ajax_url: string, nonce: string, product_id: number }
@@ -27,10 +29,11 @@
         var uploadBtn    = document.getElementById( 'audio-wm-upload-btn' );
         var fileInput    = document.getElementById( 'audio-wm-file' );
         var statusDiv    = document.getElementById( 'audio-wm-upload-status' );
-        var s3KeyInput   = document.getElementById( '_audio_wm_s3_key' );
+        var s3KeysInput  = document.getElementById( '_audio_wm_s3_keys' );
+        var filesList    = document.getElementById( 'audio-wm-files-list' );
 
         // Guard: elements must all exist (we're on a product edit page).
-        if ( ! uploadBtn || ! fileInput || ! statusDiv || ! s3KeyInput ) {
+        if ( ! uploadBtn || ! fileInput || ! statusDiv || ! s3KeysInput || ! filesList ) {
             return;
         }
 
@@ -39,34 +42,70 @@
             return;
         }
 
-        var ajaxUrl    = window.AudioWM.ajax_url;
-        var nonce      = window.AudioWM.nonce;
-        var productId  = window.AudioWM.product_id;
+        var ajaxUrl   = window.AudioWM.ajax_url;
+        var nonce     = window.AudioWM.nonce;
+        var productId = window.AudioWM.product_id;
 
         // ── Helpers ──────────────────────────────────────────────────────────
 
-        /**
-         * Set the status message and optionally a CSS colour.
-         *
-         * @param {string} message  Text to display.
-         * @param {string} [color]  CSS colour string, e.g. 'green' or '#c00'.
-         */
         function setStatus( message, color ) {
             statusDiv.textContent = message;
             statusDiv.style.color = color || '';
         }
 
-        /**
-         * Disable / enable the upload button during async operations.
-         *
-         * @param {boolean} disabled
-         */
         function setBusy( disabled ) {
-            uploadBtn.disabled = disabled;
-            uploadBtn.textContent = disabled
-                ? 'Uploading…'     // "Uploading…"
-                : 'Upload master audio';
+            uploadBtn.disabled    = disabled;
+            uploadBtn.textContent = disabled ? 'Uploading…' : 'Add master audio file';
         }
+
+        /** Read the current list of S3 keys from the hidden input. */
+        function getKeys() {
+            try { return JSON.parse( s3KeysInput.value || '[]' ) || []; } catch ( e ) { return []; }
+        }
+
+        /** Write an updated key array back to the hidden input and fire a change event. */
+        function setKeys( keys ) {
+            s3KeysInput.value = JSON.stringify( keys );
+            s3KeysInput.dispatchEvent( new Event( 'change', { bubbles: true } ) );
+        }
+
+        /** Append one file row to the visible list. */
+        function addFileRow( key ) {
+            var li   = document.createElement( 'li' );
+            li.setAttribute( 'data-key', key );
+            li.style.cssText = 'display:flex;align-items:center;gap:8px;margin-bottom:4px;';
+
+            var code = document.createElement( 'code' );
+            code.style.flex   = '1';
+            code.textContent  = key.split( '/' ).pop();
+
+            var btn = document.createElement( 'button' );
+            btn.type      = 'button';
+            btn.className = 'button-link audio-wm-remove-file';
+            btn.style.color = '#a00';
+            btn.textContent = 'Remove';
+
+            li.appendChild( code );
+            li.appendChild( btn );
+            filesList.appendChild( li );
+        }
+
+        // ── Remove handler (event delegation — works for rows added dynamically) ──
+
+        filesList.addEventListener( 'click', function ( e ) {
+            if ( ! e.target.classList.contains( 'audio-wm-remove-file' ) ) {
+                return;
+            }
+            var li  = e.target.closest( 'li' );
+            var key = li ? li.getAttribute( 'data-key' ) : null;
+            if ( ! key ) {
+                return;
+            }
+            setKeys( getKeys().filter( function ( k ) { return k !== key; } ) );
+            if ( li.parentNode ) {
+                li.parentNode.removeChild( li );
+            }
+        } );
 
         // ── Step 1: button click → open file picker ──────────────────────────
 
@@ -105,7 +144,6 @@
                 return response.json();
             } )
             .then( function ( data ) {
-                // WordPress wraps success/error in { success: bool, data: {} }.
                 if ( ! data.success ) {
                     var msg = ( data.data && data.data.message )
                         ? data.data.message
@@ -126,10 +164,8 @@
 
                 return fetch( uploadUrl, {
                     method:  'PUT',
-                    headers: {
-                        'Content-Type': file.type || 'application/octet-stream',
-                    },
-                    body: file,
+                    headers: { 'Content-Type': file.type || 'application/octet-stream' },
+                    body:    file,
                 } )
                 .then( function ( s3Response ) {
                     if ( ! s3Response.ok ) {
@@ -137,26 +173,21 @@
                             new Error( 'S3 upload failed with status ' + s3Response.status )
                         );
                     }
-                    // ── Step 5: Update the S3 key field and show success ──────
-                    s3KeyInput.value = s3Key;
-                    // Trigger the WooCommerce change event so the "Save product"
-                    // button becomes aware that the field has changed.
-                    var changeEvent = new Event( 'change', { bubbles: true } );
-                    s3KeyInput.dispatchEvent( changeEvent );
-
-                    setStatus(
-                        '✔ Upload complete! Save the product to persist the S3 key.',
-                        'green'
-                    );
+                    // ── Step 5: Append key to list; prompt to save ────────────
+                    var keys = getKeys();
+                    if ( keys.indexOf( s3Key ) === -1 ) {
+                        keys.push( s3Key );
+                        setKeys( keys );
+                        addFileRow( s3Key );
+                    }
+                    setStatus( '✔ Upload complete! Save the product to persist.', 'green' );
                 } );
             } )
             .catch( function ( error ) {
-                // ── Step 6: Surface any error ─────────────────────────────────
                 setStatus( '✖ ' + ( error.message || 'Upload failed.' ), '#c00' );
             } )
             .finally( function () {
                 setBusy( false );
-                // Reset the file input so the same file can be re-uploaded.
                 fileInput.value = '';
             } );
         } );

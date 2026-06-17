@@ -173,20 +173,29 @@ If instead you see:
 
 ### 4b. Upload the master audio
 
-1. Click **Upload master audio**.
-2. Pick your WAV or MP3 file. The browser requests a presigned S3 URL from the
+You can upload **one or more master files** per product (e.g. separate chapters
+or CD parts — each becomes its own download button for the buyer).
+
+1. Click **Add master audio file**.
+2. Pick a WAV or MP3 file. The browser requests a presigned S3 URL from the
    service and then uploads the file directly to S3 — it never passes through
    WordPress.
 3. Wait for the status line to show:
-   > ✔ Upload complete! Save the product to persist the S3 key.
-4. The **S3 master key** field fills automatically (e.g.
-   `masters/123/my_audiobook.wav`). This value is read-only — it is set by the
-   upload flow.
-5. Click **Publish** / **Update** to save the product.
+   > ✔ Upload complete! Save the product to persist.
+4. The file appears in the master file list below the button with its filename
+   and a **Remove** link.
+5. **Repeat** steps 1–4 for each additional chapter/part file.
+6. Click **Publish** / **Update** to save the product.
 
-> **Important:** the S3 key is only saved to the database when you save the
-> product. If you leave the page before saving, the file is in S3 but the
-> product has no key reference. Just re-upload and save.
+> **Single-file audiobook:** just upload one file. The buyer sees one download
+> button labelled "Download: [product name]".
+>
+> **Multi-file audiobook (chapters/parts):** upload each file in order. The buyer
+> sees one button per file: "Download: [product name] — [filename stem]".
+>
+> **Important:** the file list is only saved to the database when you save the
+> product. If you leave the page before saving, the files are in S3 but the
+> product has no record of them. Re-upload and save.
 
 ### 4c. Set a price and publish
 
@@ -216,11 +225,13 @@ manually in the next step.
 ### 4f. Download as the customer
 
 1. As the customer, go to **My Account → Orders → view** the order.
-2. Below the order table you should see an **Audiobook Downloads** section with
-   a **Download: [product name]** button.
-3. Click it. The browser should download a file named
-   `my_audiobook_orderXXXXXX.mp3` (not `7.mp3` — the order ID is embedded in
-   the filename).
+2. Below the order table you should see an **Audiobook Downloads** section.
+   - **Single-file product:** one button "Download: [product name]".
+   - **Multi-file product:** one button per chapter, e.g. "Download: [product name] — chapter-01".
+   - **Non-audio products** (PDFs, physical goods): no button — they are skipped automatically.
+3. Click a button. The browser should download a file named
+   `<stem>_orderXXXXXX.mp3` (e.g. `chapter-01_order12345.mp3`). The order ID
+   is embedded in both the watermark and the filename.
 4. Play the file and confirm it sounds correct.
 
 ### 4g. Verify the watermark (optional forensic check)
@@ -268,20 +279,21 @@ returns:
 
 No extra steps are needed — the status check is automatic.
 
-### Replacing a master audio file
+### Adding, replacing, or removing master audio files
 
-If you need to re-upload a corrected version of the master:
+**Add a new chapter/part:** click **Add master audio file** on the product edit
+page, upload the file, and save the product. Future orders will include the new
+file. Existing orders are unaffected.
 
-1. Edit the product.
-2. Click **Upload master audio** again and pick the new file.
-3. Save the product.
+**Replace a file:** remove the old entry from the list (click **Remove** next to
+it), then add the new file via **Add master audio file**, and save the product.
 
-**Note:** existing buyer copies already in S3 (`orders/…`) are **not** replaced
-automatically — they were created from the old master and will be served until
-their 30-day expiry. After expiry, the next download click regenerates from the
-new master. If you need all buyers to get the new version immediately, there is
-no automated path today; you would need to delete the individual `orders/`
-objects from S3 manually.
+**Note on existing buyers:** buyer copies already in S3 (`orders/…`) were created
+from whichever masters were live at order time. Removing or replacing a master
+does not re-watermark those copies. After the 30-day expiry, the next download
+click regenerates from the then-current master. If you need all buyers to get a
+corrected version immediately, delete the relevant `orders/<id>/<item>/...` objects
+from S3 manually — the next download will re-watermark automatically.
 
 ### Tracing a leaked file
 

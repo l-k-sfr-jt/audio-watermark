@@ -39,23 +39,42 @@ class Audio_WM_Product_Panel {
             'value'       => get_post_meta( $post->ID, '_audio_wm_enabled', true ),
         ] );
 
-        // ── S3 master key (set by JS after a successful upload) ──────────────
-        woocommerce_wp_text_input( [
-            'id'                => '_audio_wm_s3_key',
-            'label'             => __( 'S3 master key', 'audio-watermark-woo' ),
-            'description'       => __( 'Filled automatically after the master audio file is uploaded.', 'audio-watermark-woo' ),
-            'desc_tip'          => true,
-            'value'             => get_post_meta( $post->ID, '_audio_wm_s3_key', true ),
-            'custom_attributes' => [ 'readonly' => 'readonly' ],
-        ] );
-
-        // ── Upload control ───────────────────────────────────────────────────
+        // ── Multi-file master list (set by JS after each upload) ────────────
+        // New format: _audio_wm_s3_keys holds a JSON array of S3 keys.
+        // Falls back to legacy _audio_wm_s3_key (single string) for existing products.
+        $keys_json   = get_post_meta( $post->ID, '_audio_wm_s3_keys', true );
+        $master_keys = [];
+        if ( $keys_json ) {
+            $master_keys = json_decode( $keys_json, true ) ?: [];
+        }
+        if ( empty( $master_keys ) ) {
+            $legacy_key = get_post_meta( $post->ID, '_audio_wm_s3_key', true );
+            if ( $legacy_key ) {
+                $master_keys = [ $legacy_key ];
+            }
+        }
         ?>
         <p class="form-field">
-            <label><?php esc_html_e( 'Master audio file', 'audio-watermark-woo' ); ?></label>
+            <label><?php esc_html_e( 'Master audio files', 'audio-watermark-woo' ); ?></label>
+
+            <input type="hidden"
+                   id="_audio_wm_s3_keys"
+                   name="_audio_wm_s3_keys"
+                   value="<?php echo esc_attr( wp_json_encode( $master_keys ) ); ?>">
+
+            <ul id="audio-wm-files-list" style="margin:0 0 8px;padding:0;list-style:none;">
+            <?php foreach ( $master_keys as $mk ) : ?>
+                <li style="display:flex;align-items:center;gap:8px;margin-bottom:4px;" data-key="<?php echo esc_attr( $mk ); ?>">
+                    <code style="flex:1;"><?php echo esc_html( basename( $mk ) ); ?></code>
+                    <button type="button" class="button-link audio-wm-remove-file" style="color:#a00;">
+                        <?php esc_html_e( 'Remove', 'audio-watermark-woo' ); ?>
+                    </button>
+                </li>
+            <?php endforeach; ?>
+            </ul>
 
             <button type="button" id="audio-wm-upload-btn" class="button">
-                <?php esc_html_e( 'Upload master audio', 'audio-watermark-woo' ); ?>
+                <?php esc_html_e( 'Add master audio file', 'audio-watermark-woo' ); ?>
             </button>
 
             <input type="file"
@@ -63,7 +82,7 @@ class Audio_WM_Product_Panel {
                    accept="audio/*"
                    style="display:none">
 
-            <span id="audio-wm-upload-status" style="margin-left:10px;"></span>
+            <span id="audio-wm-upload-status" style="display:block;margin-top:6px;"></span>
         </p>
         <?php
 
@@ -80,13 +99,21 @@ class Audio_WM_Product_Panel {
         $enabled = isset( $_POST['_audio_wm_enabled'] ) ? 'yes' : 'no';
         update_post_meta( $post_id, '_audio_wm_enabled', $enabled );
 
-        // S3 key: plain text, no HTML allowed.
-        if ( isset( $_POST['_audio_wm_s3_key'] ) ) {
-            update_post_meta(
-                $post_id,
-                '_audio_wm_s3_key',
-                sanitize_text_field( wp_unslash( $_POST['_audio_wm_s3_key'] ) )
-            );
+        // Multi-file master keys: stored as a JSON array in _audio_wm_s3_keys.
+        // Each entry must start with masters/ and must not contain .. segments.
+        if ( isset( $_POST['_audio_wm_s3_keys'] ) ) {
+            $raw   = wp_unslash( $_POST['_audio_wm_s3_keys'] ); // phpcs:ignore WordPress.Security.ValidatedSanitizedInput
+            $keys  = json_decode( $raw, true );
+            $clean = [];
+            if ( is_array( $keys ) ) {
+                foreach ( $keys as $key ) {
+                    $key = sanitize_text_field( (string) $key );
+                    if ( strncmp( $key, 'masters/', 8 ) === 0 && strpos( $key, '..' ) === false ) {
+                        $clean[] = $key;
+                    }
+                }
+            }
+            update_post_meta( $post_id, '_audio_wm_s3_keys', wp_json_encode( $clean ) );
         }
     }
 
