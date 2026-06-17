@@ -10,7 +10,9 @@ behind an API key) plus a WooCommerce plugin that uploads masters, watermarks on
 order completion, and serves self-renewing buyer downloads. No SES — WordPress
 handles all customer email.
 
-For a full picture see **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** (components,
+**[docs/SETUP.md](docs/SETUP.md)** is the end-to-end setup guide: AWS deploy →
+plugin install → product configuration → first test order → day-to-day ops.
+For deeper reading see **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** (components,
 API contract, data model, security) and **[docs/USE-CASES.md](docs/USE-CASES.md)**
 (end-to-end flows + known limitations).
 
