@@ -59,6 +59,14 @@ class Audio_WM_Order_Handler {
                 continue;
             }
 
+            // Skip items already watermarked in a previous run (e.g. if the
+            // order-completed hook fires twice due to a manual status change).
+            // The service call is idempotent, but we avoid queuing extra
+            // Action Scheduler jobs for items that are already done.
+            if ( $item->get_meta( '_audio_wm_master_key' ) ) {
+                continue;
+            }
+
             try {
                 // item_id namespaces the stored copy (orders/<order_id>/<item_id>.mp3)
                 // so multiple different audiobooks in one order don't collide on a

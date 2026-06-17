@@ -197,11 +197,26 @@ forensic tracing is unchanged (G4 still applies). Omitting `item_id` falls back 
 the order-level key for single-item / web-console use. Verified: two items in one
 order produce distinct keys; `item_id` ≤ 0 is rejected with `400`.
 
-### G2 — Failed watermarking at completion is silent to staff
-If the service call in UC-3 fails, it is only `error_log`-ged; the order
-completes, no `_audio_wm_master_key` is stored, and the buyer simply sees no
-download button. There is no admin notice, retry, or order note. Consider a
-WooCommerce order note and/or an admin-visible retry.
+### G2 — ✅ RESOLVED — Failed watermarking now retried automatically with order notes
+
+*Was:* a failed service call in UC-3 was only `error_log`-ged; the buyer saw no
+download button and staff had no visibility.
+
+*Fix:* `class-order-handler.php` now adds a **WooCommerce order note** on every
+watermarking attempt (success or failure), visible to staff in WC Admin → Orders.
+On failure it uses **Action Scheduler** (ships with WooCommerce ≥ 3.5) to
+schedule automatic retries:
+
+| Attempt | Delay |
+|---------|-------|
+| Retry 1 | +5 min |
+| Retry 2 | +30 min |
+| Retry 3 | +2 h |
+
+Each retry attempt adds its own order note (success / failure / "manual action
+required" after all attempts exhausted). Items that are already watermarked
+(have `_audio_wm_master_key` set) are skipped so a double-fire of the
+completion hook does not queue duplicate retries.
 
 ### G3 — Master change / deletion after orders exist
 - Changing a product's `_audio_wm_s3_key` does **not** regenerate already-cached
@@ -250,7 +265,7 @@ plugin are current; these two guides need rewriting.
 | Buyer download (UC-4) | ✅ implemented (per item) |
 | Re-download after expiry (UC-5) | ✅ implemented |
 | Forensic trace (UC-6) | ✅ implemented (per-order granularity, G4) |
-| Failure visibility to staff (G2) | ❌ not implemented |
+| Failure visibility to staff + retry (G2) | ✅ order notes + Action Scheduler retry |
 | Master change/delete safety (G3) | ⚠️ partial |
 | Trim resistance (G5) | ❌ by design |
 | Non-completed delivery workflows (G6) | ❌ not implemented |

@@ -13,9 +13,12 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 _PRODUCT_ID_RE = re.compile(r"^[A-Za-z0-9_\-]+$")
+# application/octet-stream is intentionally excluded: it's a generic type that
+# would let any binary file bypass the audio-only restriction on presigned PUTs.
+# The WooCommerce plugin always sends an explicit audio MIME type.
 _AUDIO_CONTENT_TYPES = {"audio/wav", "audio/x-wav", "audio/mpeg", "audio/mp3",
                          "audio/flac", "audio/x-flac", "audio/aiff", "audio/ogg",
-                         "audio/opus", "application/octet-stream"}
+                         "audio/opus"}
 
 
 def _parse_body(event: dict) -> dict:
@@ -81,7 +84,7 @@ def route_upload_url(event: dict) -> dict:
     body = _parse_body(event)
     product_id = str(body.get("product_id", "")).strip()
     filename = str(body.get("filename", "")).strip()
-    content_type = str(body.get("content_type", "application/octet-stream")).strip()
+    content_type = str(body.get("content_type", "")).strip()
 
     if not product_id or not _PRODUCT_ID_RE.match(product_id):
         return _error(400, "product_id must be non-empty alphanumeric/hyphen/underscore")
@@ -98,7 +101,8 @@ def route_upload_url(event: dict) -> dict:
     try:
         upload_url = storage.generate_presigned_put(bucket, s3_key, content_type, expiry=900)
     except Exception as exc:
-        return _error(500, f"Failed to generate presigned PUT URL: {exc}")
+        logger.error("generate_presigned_put failed for key=%s: %s", s3_key, exc)
+        return _error(500, "Failed to generate upload URL")
 
     logger.info("Issued upload URL: product=%s key=%s", product_id, s3_key)
     return _ok({"upload_url": upload_url, "s3_key": s3_key})
@@ -169,7 +173,8 @@ def route_watermark(event: dict) -> dict:
             )
             return _ok({"download_url": download_url, "watermark_code": order_id, "from_cache": True})
     except Exception as exc:
-        return _error(500, f"S3 head-object failed: {exc}")
+        logger.error("object_exists check failed for key=%s: %s", output_key, exc)
+        return _error(500, "Storage check failed")
 
     # Slow path: download master → embed watermark → transcode → upload → presign.
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -183,31 +188,37 @@ def route_watermark(event: dict) -> dict:
             code = exc.response.get("Error", {}).get("Code", "")
             if code in ("NoSuchKey", "NoSuchBucket", "404"):
                 return _error(404, f"Master not found in S3: {master_key}")
-            return _error(500, f"S3 download failed for '{master_key}': {exc}")
+            logger.error("S3 download failed for key=%s: %s", master_key, exc)
+            return _error(500, "Failed to retrieve audio master")
         except Exception as exc:
-            return _error(500, f"S3 download failed for '{master_key}': {exc}")
+            logger.error("S3 download failed for key=%s: %s", master_key, exc)
+            return _error(500, "Failed to retrieve audio master")
 
         embed_start = time.monotonic()
         try:
             watermark.embed_watermark(input_path, order_id, wav_path)
         except Exception as exc:
-            return _error(500, f"Watermark embedding failed: {exc}")
+            logger.error("embed_watermark failed for order=%s: %s", order_id, exc)
+            return _error(500, "Audio processing failed")
         embed_ms = (time.monotonic() - embed_start) * 1000
 
         try:
             watermark.transcode_to_mp3(wav_path, mp3_path)
         except Exception as exc:
-            return _error(500, f"MP3 transcoding failed: {exc}")
+            logger.error("transcode_to_mp3 failed for order=%s: %s", order_id, exc)
+            return _error(500, "Audio transcoding failed")
 
         try:
             storage.upload_to_s3(mp3_path, bucket, output_key)
         except Exception as exc:
-            return _error(500, f"S3 upload failed for '{output_key}': {exc}")
+            logger.error("S3 upload failed for key=%s: %s", output_key, exc)
+            return _error(500, "Failed to store processed audio")
 
         try:
             download_url = storage.generate_presigned_url(bucket, output_key)
         except Exception as exc:
-            return _error(500, f"Presigned URL generation failed: {exc}")
+            logger.error("generate_presigned_url failed for key=%s: %s", output_key, exc)
+            return _error(500, "Failed to generate download link")
 
     logger.info(json.dumps({
         "event": "watermark_complete", "order_id": order_id,

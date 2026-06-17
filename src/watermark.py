@@ -93,17 +93,21 @@ def _load_head(path: str, max_samples: int) -> tuple[np.ndarray, int, bool]:
         pass  # fall through to ffmpeg for MP3 / unsupported formats
 
     # Probe for sample rate and duration without decoding the full file.
-    probe = subprocess.run(
-        [
-            "ffprobe", "-v", "error", "-select_streams", "a:0",
-            "-show_entries", "stream=sample_rate,duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            path,
-        ],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
+    try:
+        probe = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-select_streams", "a:0",
+                "-show_entries", "stream=sample_rate,duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                path,
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(f"ffprobe failed on '{path}': {exc.stderr}") from exc
+
     lines = probe.stdout.strip().split("\n")
     sr = int(lines[0])
     try:
@@ -112,43 +116,50 @@ def _load_head(path: str, max_samples: int) -> tuple[np.ndarray, int, bool]:
         file_is_longer = True  # assume longer if duration unavailable
 
     head_seconds = max_samples / sr
-    decoded = subprocess.run(
-        [
-            "ffmpeg", "-y",
-            "-t", f"{head_seconds:.6f}",
-            "-i", path,
-            "-f", "f64le",
-            "-ac", "1",
-            "-ar", str(sr),
-            "pipe:1",
-        ],
-        capture_output=True,
-        check=True,
-    )
+    try:
+        decoded = subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-t", f"{head_seconds:.6f}",
+                "-i", path,
+                "-f", "f64le",
+                "-ac", "1",
+                "-ar", str(sr),
+                "pipe:1",
+            ],
+            capture_output=True,
+            check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(f"ffmpeg decode failed on '{path}': {exc.stderr.decode()}") from exc
+
     samples = np.frombuffer(decoded.stdout, dtype=np.float64).copy()
     return samples[:max_samples], sr, file_is_longer
 
 
 def _stitch_with_tail(head_wav: str, original: str, skip_seconds: float, sr: int, out_wav: str) -> None:
     """Append original[skip_seconds:] (converted to mono at sr) after head_wav."""
-    subprocess.run(
-        [
-            "ffmpeg", "-y",
-            "-i", head_wav,
-            "-ss", f"{skip_seconds:.6f}",
-            "-i", original,
-            "-filter_complex",
-            (
-                f"[1:a]aresample={sr},"
-                "aformat=sample_fmts=s16:channel_layouts=mono[tail];"
-                "[0:a][tail]concat=n=2:v=0:a=1[out]"
-            ),
-            "-map", "[out]",
-            out_wav,
-        ],
-        check=True,
-        capture_output=True,
-    )
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-i", head_wav,
+                "-ss", f"{skip_seconds:.6f}",
+                "-i", original,
+                "-filter_complex",
+                (
+                    f"[1:a]aresample={sr},"
+                    "aformat=sample_fmts=s16:channel_layouts=mono[tail];"
+                    "[0:a][tail]concat=n=2:v=0:a=1[out]"
+                ),
+                "-map", "[out]",
+                out_wav,
+            ],
+            check=True,
+            capture_output=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(f"ffmpeg stitch failed: {exc.stderr.decode()}") from exc
 
 
 def transcode_to_mp3(wav_path: str, mp3_path: str, bitrate: str = "128k") -> str:

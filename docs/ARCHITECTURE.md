@@ -200,3 +200,37 @@ multi-hour master never loads more than a few MB into Python. Detection
 
 **Consequence (documented honestly):** the mark lives only in the first ~12 s,
 so trimming the opening removes it. See `docs/USE-CASES.md` → Known limitations.
+
+---
+
+## 7. Observability
+
+### CloudWatch metrics (Embedded Metrics Format)
+`handler.py` writes [EMF](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch_Embedded_Metric_Format.html)
+JSON to stdout on every `/watermark` call. CloudWatch ingests it as real metrics
+with no extra cost (no `PutMetricData` calls):
+
+| Metric | Unit | When emitted |
+|--------|------|--------------|
+| `CacheHit` | Count | Fast path — buyer copy already in S3 |
+| `CacheMiss` | Count | Slow path — new embed + transcode |
+| `EmbedDuration` | Milliseconds | Slow path only (embedding time) |
+
+Namespace: `AudioWM`. Dimension: `Service = audio-watermark`.
+All `logger.info` entries are structured JSON, so CloudWatch Logs Insights can
+query on `event`, `order_id`, `embed_ms`, etc.
+
+### X-Ray tracing
+`Tracing: Active` in `template.yaml`. SAM attaches the X-Ray daemon automatically.
+Traces API Gateway → Lambda → S3 calls. Free tier: 100k traces/month.
+
+### WooCommerce order notes
+`class-order-handler.php` adds a note to every order on each watermark attempt
+(success, retry, and final failure). Staff see watermark status directly in
+WC Admin → Orders without needing AWS console access.
+
+### `detect_watermark` confidence score
+`watermark.py::detect_watermark()` returns `(code: int, confidence: float)`.
+Confidence = `min(|votes|) / max(|votes|)` — a 0-1 score computed from the
+per-bit DCT correlation margins at zero extra cost. Values > ~0.1 are reliably
+correct; the CLI prints it alongside the code.

@@ -54,6 +54,12 @@ handler calls `transcode_to_mp3()` to convert the result to MP3 128 kbps.
 are decoded into numpy. For longer files the untouched tail is stitched back via
 ffmpeg concat, so a multi-hour master never loads more than ~4 MB into Python.
 
+**`detect_watermark()` returns `(code: int, confidence: float)`** — a tuple, not
+a bare int. `confidence` is `min(|votes|) / max(|votes|)`, a 0-1 score where 1.0
+means every bit voted unanimously and values > ~0.1 are reliably correct. Returns
+`(-1, 0.0)` when the audio is too short. CLI usage: `python cli.py detect file.mp3`
+prints both the code and the confidence score.
+
 ## Development Commands
 
 ```bash
@@ -112,6 +118,22 @@ that line item.
 | Variable      | Description                           |
 |---------------|---------------------------------------|
 | `BUCKET_NAME` | S3 bucket for all audio               |
+
+## Observability
+
+**CloudWatch metrics** are emitted from `handler.py` via [Embedded Metrics Format](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch_Embedded_Metric_Format.html) (structured JSON written to Lambda stdout — no `PutMetricData` calls, no extra cost):
+
+| Metric | Namespace | Unit | When |
+|--------|-----------|------|------|
+| `CacheHit` | `AudioWM` | Count | Fast path (buyer copy already in S3) |
+| `CacheMiss` | `AudioWM` | Count | Slow path (new embed + transcode) |
+| `EmbedDuration` | `AudioWM` | Milliseconds | Slow path only |
+
+Dimensions: `{"Service": "audio-watermark"}`. All log entries are structured JSON queryable in CloudWatch Logs Insights.
+
+**X-Ray tracing**: `Tracing: Active` in `template.yaml` — SAM attaches the X-Ray daemon automatically. Free tier: 100k traces/month.
+
+**WooCommerce order notes**: `class-order-handler.php` adds an order note on every watermark attempt (success / each retry / exhausted). Staff can see watermark status directly in WC Admin → Orders without checking CloudWatch.
 
 ## Architectural Rules
 

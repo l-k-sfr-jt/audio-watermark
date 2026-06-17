@@ -133,10 +133,9 @@ class Audio_WM_Product_Panel {
      */
     public function ajax_get_upload_url(): void {
         // ── Security ─────────────────────────────────────────────────────────
-        if ( ! check_ajax_referer( 'audio_wm_upload_nonce', 'nonce', false ) ) {
-            wp_send_json_error( [ 'message' => __( 'Security check failed.', 'audio-watermark-woo' ) ], 403 );
-            return;
-        }
+        // No `false` third arg: let check_ajax_referer() die automatically on
+        // invalid nonce rather than relying on the caller to return after the check.
+        check_ajax_referer( 'audio_wm_upload_nonce', 'nonce' );
 
         if ( ! current_user_can( 'edit_products' ) ) {
             wp_send_json_error( [ 'message' => __( 'Permission denied.', 'audio-watermark-woo' ) ], 403 );
