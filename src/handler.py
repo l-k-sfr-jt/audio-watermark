@@ -225,7 +225,10 @@ def route_watermark(event: dict) -> dict:
         embed_ms = (time.monotonic() - embed_start) * 1000
 
         try:
-            storage.upload_to_s3(mp3_path, bucket, output_key)
+            storage.upload_to_s3(
+                mp3_path, bucket, output_key,
+                content_disposition=f'attachment; filename="{download_name}"',
+            )
         except Exception as exc:
             logger.error("S3 upload failed for key=%s: %s", output_key, exc)
             return _error(500, "Failed to store processed audio")

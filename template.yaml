@@ -2,6 +2,16 @@ AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: Forensic audio watermarking service — embeds a buyer order ID into audiobooks
 
+Parameters:
+  CFPrivateKeyParam:
+    Type: String
+    Default: "/audio-watermark/cf-private-key"
+    Description: "SSM SecureString path for the CloudFront signing private key PEM (set by deploy.sh)."
+  CFPublicKeyParam:
+    Type: String
+    Default: "/audio-watermark/cf-public-key"
+    Description: "SSM String path for the CloudFront signing public key PEM (set by deploy.sh)."
+
 # This template provisions everything the service needs so the only step after
 # `sam deploy` is configuring the returned API base URL and key in your plugin:
 #   - S3 bucket (masters/ permanent; orders/ 30-day auto-expiry)
@@ -62,6 +72,76 @@ Resources:
               - "Content-Type"
             MaxAge: 3000
 
+  # ----- S3 bucket policy (allows CloudFront OAC to read orders/) -----------
+  # Must be a separate resource so it can reference the CloudFront distribution ARN.
+  AudioBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AudioBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontOAC
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "arn:aws:s3:::${AudioBucket}/orders/*"
+            Condition:
+              StringEquals:
+                "AWS:SourceArn": !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}"
+
+  # ----- CloudFront delivery (egress 1 TB/month free; ~$0.085/GB after) ----
+  CloudFrontOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AWS::StackName}-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # Public key for signed URL verification.  The PEM is read from SSM
+  # (put there by deploy.sh) via a CloudFormation dynamic reference.
+  CloudFrontPublicKey:
+    Type: AWS::CloudFront::PublicKey
+    Properties:
+      PublicKeyConfig:
+        CallerReference: !Sub "${AWS::StackName}-cf-pubkey-v1"
+        Name: !Sub "${AWS::StackName}-signing-key"
+        EncodedKey: !Sub "{{resolve:ssm:${CFPublicKeyParam}}}"
+
+  CloudFrontKeyGroup:
+    Type: AWS::CloudFront::KeyGroup
+    Properties:
+      KeyGroupConfig:
+        Name: !Sub "${AWS::StackName}-key-group"
+        Items:
+          - !Ref CloudFrontPublicKey
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${AWS::StackName} buyer audio delivery"
+        # PriceClass_100: NA + Europe (includes CZ) — cheapest tier.
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt AudioBucket.RegionalDomainName
+            S3OriginConfig: {}
+            OriginAccessControlId: !GetAtt CloudFrontOAC.Id
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: https-only
+          # All requests must carry a valid signed URL — enforces auth at edge.
+          TrustedKeyGroups:
+            - !Ref CloudFrontKeyGroup
+          # CachingDisabled managed policy (no caching — files are per-buyer).
+          # Egress savings still apply: CF → internet costs less than S3 → internet.
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+
   # ----- Compute ------------------------------------------------------------
   AudioWatermarkFunction:
     Type: AWS::Serverless::Function
@@ -83,6 +163,9 @@ Resources:
       Environment:
         Variables:
           BUCKET_NAME: !Ref AudioBucket
+          CF_DOMAIN: !GetAtt CloudFrontDistribution.DomainName
+          CF_KEY_ID: !GetAtt CloudFrontPublicKey.Id
+          CF_PRIVATE_KEY_PARAM: !Ref CFPrivateKeyParam
       Policies:
         # Least-privilege S3 access — no DeleteObject, no ListBucket.
         # GetObject: download masters + generate presigned GETs for orders/
@@ -102,6 +185,9 @@ Resources:
             - Effect: Allow
               Action: s3:HeadObject
               Resource: !Sub "arn:aws:s3:::${AudioBucket}/orders/*"
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${CFPrivateKeyParam}"
       Events:
         UploadUrlApi:
           Type: Api
@@ -160,6 +246,9 @@ Resources:
       UsagePlanId: !Ref WatermarkUsagePlan
 
 Outputs:
+  CloudFrontDomain:
+    Description: CloudFront distribution domain for buyer audio delivery
+    Value: !GetAtt CloudFrontDistribution.DomainName
   BucketName:
     Description: S3 bucket for master and watermarked audio
     Value: !Ref AudioBucket

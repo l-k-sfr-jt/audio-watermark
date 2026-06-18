@@ -28,8 +28,8 @@
  *    lifecycle). Expired links render a friendly page with a "request a new link"
  *    button that re-emails a fresh link (throttled to once per hour).
  *  - Status guard blocks refunded / cancelled / failed orders.
- *  - download_url from the service is validated to an amazonaws.com host before
- *    redirecting, to prevent open-redirect abuse.
+ *  - download_url from the service is validated to an amazonaws.com or cloudfront.net
+ *    host before redirecting, to prevent open-redirect abuse.
  *
  * Note on `woocommerce_order_details_after_order_table`: this hook also fires inside
  * WooCommerce HTML order emails. The get_current_user_id() === 0 check inside
@@ -471,13 +471,16 @@ class Audio_WM_Download_Handler {
         }
 
         // ── Validate download_url domain (open-redirect guard) ────────────────
+        // Allow S3 presigned URLs (*.amazonaws.com) and CloudFront signed URLs
+        // (*.cloudfront.net) — both are used depending on Lambda configuration.
         $download_url = $result['download_url'];
         $host         = (string) wp_parse_url( $download_url, PHP_URL_HOST );
-        if ( ! $host
-            || 'https' !== wp_parse_url( $download_url, PHP_URL_SCHEME )
-            || substr( $host, -strlen( '.amazonaws.com' ) ) !== '.amazonaws.com'
-        ) {
-            error_log( "[Audio WM] Rejected non-S3 download_url for order #{$order_id}: {$download_url}" );
+        $host_ok      = $host && (
+            substr( $host, -strlen( '.amazonaws.com' ) ) === '.amazonaws.com'
+            || substr( $host, -strlen( '.cloudfront.net' ) ) === '.cloudfront.net'
+        );
+        if ( ! $host_ok || 'https' !== wp_parse_url( $download_url, PHP_URL_SCHEME ) ) {
+            error_log( "[Audio WM] Rejected non-S3/CF download_url for order #{$order_id}: {$download_url}" );
             wp_die( esc_html__( 'Invalid download URL returned by service.', 'audio-watermark-woo' ), '', [ 'response' => 502 ] );
             return;
         }

@@ -3,4 +3,5 @@ scipy==1.13.1
 soundfile==0.12.1
 pydub==0.25.1
 boto3==1.35.36
+cryptography>=42.0.0
 pytest==8.2.2
