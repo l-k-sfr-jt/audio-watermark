@@ -196,10 +196,9 @@ def route_watermark(event: dict) -> dict:
     except Exception as exc:
         logger.warning("object_exists check failed for key=%s (skipping cache, continuing to watermark): %s", output_key, exc)
 
-    # Slow path: download master → embed watermark → transcode → upload → presign.
+    # Slow path: download master → embed watermark + mux to MP3 → upload → presign.
     with tempfile.TemporaryDirectory() as tmp_dir:
         input_path = os.path.join(tmp_dir, "master")
-        wav_path = os.path.join(tmp_dir, "watermarked.wav")
         mp3_path = os.path.join(tmp_dir, "watermarked.mp3")
 
         try:
@@ -214,19 +213,16 @@ def route_watermark(event: dict) -> dict:
             logger.error("S3 download failed for key=%s: %s", master_key, exc)
             return _error(500, "Failed to retrieve audio master")
 
+        # embed_mp3 stream-copies the untouched tail for MP3 masters (only the
+        # watermarked head is re-encoded), and transparently falls back to a full
+        # decode→watermark→transcode for non-MP3 or very short files.
         embed_start = time.monotonic()
         try:
-            watermark.embed_watermark(input_path, order_id, wav_path)
+            watermark.embed_mp3(input_path, order_id, mp3_path)
         except Exception as exc:
-            logger.error("embed_watermark failed for order=%s: %s", order_id, exc)
+            logger.error("embed_mp3 failed for order=%s: %s", order_id, exc)
             return _error(500, "Audio processing failed")
         embed_ms = (time.monotonic() - embed_start) * 1000
-
-        try:
-            watermark.transcode_to_mp3(wav_path, mp3_path)
-        except Exception as exc:
-            logger.error("transcode_to_mp3 failed for order=%s: %s", order_id, exc)
-            return _error(500, "Audio transcoding failed")
 
         try:
             storage.upload_to_s3(mp3_path, bucket, output_key)

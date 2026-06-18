@@ -1,4 +1,5 @@
 import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -6,7 +7,13 @@ import numpy as np
 import pytest
 import soundfile as sf
 
-from src.watermark import BLOCK_SIZE, NUM_BLOCKS, detect_watermark, embed_watermark
+from src.watermark import (
+    BLOCK_SIZE,
+    NUM_BLOCKS,
+    detect_watermark,
+    embed_mp3,
+    embed_watermark,
+)
 
 SAMPLE_RATE = 44100
 # Enough samples to cover all 256 blocks with a little extra
@@ -97,3 +104,80 @@ def test_mp3_128kbps_roundtrip(tmp_path):
 
     detected, _conf = detect_watermark(mp3_path)
     assert detected == 99999, f"MP3 128kbps roundtrip failed: detected {detected}, expected 99999"
+
+
+# ---------------------------------------------------------------------------
+# Test 3: embed_mp3 stream-copy path (requires ffmpeg + ffprobe)
+# ---------------------------------------------------------------------------
+
+def _make_mp3(path: str, seconds: int, channels: int, bitrate: str = "128k") -> None:
+    """Synthesize a tone+noise MP3 master of the given length/channels."""
+    n = int(seconds * SAMPLE_RATE)
+    t = np.arange(n) / SAMPLE_RATE
+    rng = np.random.RandomState(0)
+    sig = 0.3 * np.sin(2 * np.pi * 220 * t) + 0.05 * rng.randn(n)
+    data = sig if channels == 1 else np.stack([sig, 0.9 * sig], axis=1)
+    wav = path + ".src.wav"
+    sf.write(wav, data.astype(np.float32), SAMPLE_RATE)
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", wav, "-b:a", bitrate, "-ac", str(channels), path],
+        check=True, capture_output=True,
+    )
+    Path(wav).unlink()
+
+
+def _decode_mono(path: str) -> np.ndarray:
+    out = subprocess.run(
+        ["ffmpeg", "-y", "-i", path, "-f", "f32le", "-ac", "1", "-ar", str(SAMPLE_RATE), "pipe:1"],
+        check=True, capture_output=True,
+    )
+    return np.frombuffer(out.stdout, dtype=np.float32)
+
+
+@pytest.mark.skipif(
+    shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
+    reason="ffmpeg/ffprobe not on PATH — skipping stream-copy test",
+)
+@pytest.mark.parametrize("channels", [1, 2])
+def test_embed_mp3_streamcopy_detects(tmp_path, channels):
+    """embed_mp3 watermarks an MP3 master and the code is recoverable (mono+stereo)."""
+    master = str(tmp_path / "master.mp3")
+    out = str(tmp_path / "out.mp3")
+    _make_mp3(master, seconds=20, channels=channels)
+
+    embed_mp3(master, 456789, out)
+    assert Path(out).exists()
+
+    detected, conf = detect_watermark(out)
+    assert detected == 456789, f"channels={channels}: detected {detected}"
+    assert conf > 0.1, f"channels={channels}: low confidence {conf}"
+
+
+@pytest.mark.skipif(
+    shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
+    reason="ffmpeg/ffprobe not on PATH — skipping stream-copy fidelity test",
+)
+def test_embed_mp3_tail_is_bit_identical(tmp_path):
+    """The untouched tail of an embed_mp3 output must be bit-faithful to the master.
+
+    MP3 carries a fixed encoder delay (one 1152-sample frame), so the output is
+    shifted by exactly that; after compensating, the tail past the watermarked
+    head must match the original sample-for-sample (zero residual = stream-copied,
+    not re-encoded).
+    """
+    master = str(tmp_path / "master.mp3")
+    out = str(tmp_path / "out.mp3")
+    _make_mp3(master, seconds=30, channels=1)
+    embed_mp3(master, 999, out)
+
+    a = _decode_mono(master)
+    b = _decode_mono(out)
+    sr = SAMPLE_RATE
+    lag = 1152  # standard MP3 encoder delay (one frame)
+    seg = slice(15 * sr, 28 * sr)  # well past the ~11.9 s watermarked head
+    aa = a[seg]
+    bb = b[15 * sr + lag:28 * sr + lag]
+    n = min(len(aa), len(bb))
+    assert n > sr, "not enough tail to compare"
+    residual = float(np.max(np.abs(aa[:n] - bb[:n])))
+    assert residual == 0.0, f"tail not bit-identical after de-delay: max residual {residual}"
