@@ -157,6 +157,138 @@ class Audio_WM_Download_Handler {
     }
 
     /**
+     * Whether an order contains at least one watermark-enabled audiobook line item.
+     *
+     * @param WC_Order $order
+     * @return bool
+     */
+    public static function order_has_audio_items( WC_Order $order ): bool {
+        foreach ( $order->get_items() as $item ) {
+            if ( ! ( $item instanceof WC_Order_Item_Product ) ) {
+                continue;
+            }
+            $product_id = (int) $item->get_product_id();
+            if ( 'yes' !== get_post_meta( $product_id, '_audio_wm_enabled', true ) ) {
+                continue;
+            }
+            if ( ! empty( self::resolve_keys_for_item( $item ) ) ) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Build WooCommerce-compatible download rows for watermark-enabled order items.
+     *
+     * @param WC_Order $order
+     * @param string   $url_mode 'token' (guest/email) or 'nonce' (logged-in owner).
+     * @return array<int, array<string, mixed>>
+     */
+    public static function get_order_download_rows( WC_Order $order, string $url_mode = 'token' ): array {
+        $rows     = [];
+        $order_id = $order->get_id();
+        $nonce    = ( 'nonce' === $url_mode ) ? wp_create_nonce( 'audio_wm_download_' . $order_id ) : '';
+
+        foreach ( $order->get_items() as $item_id => $item ) {
+            if ( ! ( $item instanceof WC_Order_Item_Product ) ) {
+                continue;
+            }
+
+            $product_id = (int) $item->get_product_id();
+            if ( 'yes' !== get_post_meta( $product_id, '_audio_wm_enabled', true ) ) {
+                continue;
+            }
+
+            $keys = self::resolve_keys_for_item( $item );
+            if ( empty( $keys ) ) {
+                continue;
+            }
+
+            $product = wc_get_product( $product_id );
+            $multi   = count( $keys ) > 1;
+
+            foreach ( $keys as $key ) {
+                $stem = self::stem_of( $key );
+                $part = $multi ? $stem : '';
+
+                if ( 'token' === $url_mode ) {
+                    $url = self::download_link( $order, (int) $item_id, $part );
+                } else {
+                    $args = [
+                        'action'   => 'audio_wm_download',
+                        'order_id' => $order_id,
+                        'item_id'  => $item_id,
+                        '_wpnonce' => $nonce,
+                    ];
+                    if ( $multi ) {
+                        $args['part'] = $stem;
+                    }
+                    $url = add_query_arg( $args, admin_url( 'admin-ajax.php' ) );
+                }
+
+                $download_name = $multi
+                    ? sprintf(
+                        /* translators: 1: product name, 2: file stem/part name */
+                        __( '%1$s — %2$s', 'audio-watermark-woo' ),
+                        $item->get_name(),
+                        $stem
+                      )
+                    : $item->get_name();
+
+                $expires_ts = time() + self::LINK_TTL;
+
+                $rows[] = [
+                    'download_url'        => $url,
+                    'download_id'         => 'audio_wm_' . $item_id . ( $part ? '_' . $part : '' ),
+                    'product_id'          => $product_id,
+                    'product_name'        => $item->get_name(),
+                    'product_url'         => ( $product && $product->is_visible() ) ? $product->get_permalink() : '',
+                    'download_name'       => $download_name,
+                    'order_id'            => $order_id,
+                    'order_key'           => $order->get_order_key(),
+                    'downloads_remaining' => '',
+                    'access_expires'      => gmdate( 'Y-m-d H:i:s', $expires_ts ),
+                    'file'                => [
+                        'name' => $download_name,
+                        'file' => 'audio_wm',
+                    ],
+                    'audio_wm'            => true,
+                ];
+            }
+        }
+
+        return $rows;
+    }
+
+    /**
+     * Re-send the enabled WooCommerce customer order email (Processing or Completed).
+     *
+     * @param WC_Order $order
+     */
+    public static function trigger_customer_order_email( WC_Order $order ): void {
+        if ( ! function_exists( 'WC' ) || ! WC()->mailer() ) {
+            return;
+        }
+
+        $emails = WC()->mailer()->get_emails();
+
+        if ( isset( $emails['WC_Email_Customer_Processing_Order'] )
+            && $emails['WC_Email_Customer_Processing_Order']->is_enabled()
+        ) {
+            $emails['WC_Email_Customer_Processing_Order']->trigger( $order->get_id(), $order );
+            return;
+        }
+
+        if ( isset( $emails['WC_Email_Customer_Completed_Order'] )
+            && $emails['WC_Email_Customer_Completed_Order']->is_enabled()
+        ) {
+            $emails['WC_Email_Customer_Completed_Order']->trigger( $order->get_id(), $order );
+        }
+    }
+
+    /**
      * Resolve the list of master S3 keys to offer for an order item.
      *
      * Precedence:
@@ -169,7 +301,7 @@ class Audio_WM_Download_Handler {
      * @param WC_Order_Item_Product $item
      * @return string[]
      */
-    private function resolve_keys_for_item( WC_Order_Item_Product $item ): array {
+    private static function resolve_keys_for_item( WC_Order_Item_Product $item ): array {
         $json = $item->get_meta( '_audio_wm_master_keys' );
         $keys = $json ? ( json_decode( $json, true ) ?: [] ) : [];
 
@@ -212,65 +344,20 @@ class Audio_WM_Download_Handler {
      * @return string[] Array of escaped <p><a>…</a></p> fragments.
      */
     private function build_button_sections( WC_Order $order, string $mode ): array {
-        $order_id = $order->get_id();
-        $nonce    = ( 'nonce' === $mode ) ? wp_create_nonce( 'audio_wm_download_' . $order_id ) : '';
         $sections = [];
 
-        foreach ( $order->get_items() as $item_id => $item ) {
-            if ( ! ( $item instanceof WC_Order_Item_Product ) ) {
-                continue;
-            }
+        foreach ( self::get_order_download_rows( $order, $mode ) as $row ) {
+            $label = sprintf(
+                /* translators: %s: download/file label */
+                __( 'Download: %s', 'audio-watermark-woo' ),
+                $row['download_name']
+            );
 
-            $product_id = (int) $item->get_product_id();
-            if ( 'yes' !== get_post_meta( $product_id, '_audio_wm_enabled', true ) ) {
-                continue;
-            }
-
-            $keys = $this->resolve_keys_for_item( $item );
-            if ( empty( $keys ) ) {
-                continue;
-            }
-
-            $multi = count( $keys ) > 1;
-
-            foreach ( $keys as $key ) {
-                $stem = self::stem_of( $key );
-                $part = $multi ? $stem : '';
-
-                if ( 'token' === $mode ) {
-                    $url = self::download_link( $order, (int) $item_id, $part );
-                } else {
-                    $args = [
-                        'action'   => 'audio_wm_download',
-                        'order_id' => $order_id,
-                        'item_id'  => $item_id,
-                        '_wpnonce' => $nonce,
-                    ];
-                    if ( $multi ) {
-                        $args['part'] = $stem;
-                    }
-                    $url = add_query_arg( $args, admin_url( 'admin-ajax.php' ) );
-                }
-
-                $label = $multi
-                    ? sprintf(
-                        /* translators: 1: product name, 2: file stem/part name */
-                        __( 'Download: %1$s — %2$s', 'audio-watermark-woo' ),
-                        $item->get_name(),
-                        $stem
-                      )
-                    : sprintf(
-                        /* translators: %s: product name */
-                        __( 'Download: %s', 'audio-watermark-woo' ),
-                        $item->get_name()
-                      );
-
-                $sections[] = sprintf(
-                    '<p><a href="%s" class="button" target="_blank" rel="nofollow">%s</a></p>',
-                    esc_url( $url ),
-                    esc_html( $label )
-                );
-            }
+            $sections[] = sprintf(
+                '<p><a href="%s" class="button woocommerce-MyAccount-downloads-file alt" target="_blank" rel="nofollow">%s</a></p>',
+                esc_url( $row['download_url'] ),
+                esc_html( $label )
+            );
         }
 
         return $sections;
@@ -284,6 +371,10 @@ class Audio_WM_Download_Handler {
      * @param WC_Order $order The order being displayed.
      */
     public function add_download_buttons( WC_Order $order ): void {
+        if ( ! apply_filters( 'audio_wm_render_legacy_download_sections', true, $order ) ) {
+            return;
+        }
+
         $current_user_id = get_current_user_id();
         if ( ! $current_user_id || $current_user_id !== (int) $order->get_customer_id() ) {
             return;
@@ -305,6 +396,10 @@ class Audio_WM_Download_Handler {
     public function render_thankyou_downloads( $order_id ): void {
         $order = wc_get_order( (int) $order_id );
         if ( ! $order ) {
+            return;
+        }
+
+        if ( ! apply_filters( 'audio_wm_render_legacy_download_sections', true, $order ) ) {
             return;
         }
 
@@ -414,7 +509,7 @@ class Audio_WM_Download_Handler {
             return;
         }
 
-        $keys = $this->resolve_keys_for_item( $item );
+        $keys = self::resolve_keys_for_item( $item );
         if ( empty( $keys ) ) {
             wp_die( esc_html__( 'Could not generate download link. Please contact support.', 'audio-watermark-woo' ), '', [ 'response' => 404 ] );
             return;
@@ -536,10 +631,18 @@ class Audio_WM_Download_Handler {
         }
 
         // ── Send a fresh email ─────────────────────────────────────────────────
-        if ( ! class_exists( 'Audio_WM_Email_Download' ) ) {
-            require_once AUDIO_WM_PLUGIN_DIR . 'includes/class-email-download.php';
+        $delivery = apply_filters( 'audio_wm_resend_delivery', 'legacy_email', $order );
+
+        if ( 'wc_order_email' === $delivery ) {
+            self::trigger_customer_order_email( $order );
+        } elseif ( is_callable( $delivery ) ) {
+            call_user_func( $delivery, $order );
+        } else {
+            if ( ! class_exists( 'Audio_WM_Email_Download' ) ) {
+                require_once AUDIO_WM_PLUGIN_DIR . 'includes/class-email-download.php';
+            }
+            Audio_WM_Email_Download::trigger_for_order( $order );
         }
-        Audio_WM_Email_Download::trigger_for_order( $order );
 
         $order->update_meta_data( '_audio_wm_last_resend', time() );
         $order->save_meta_data();

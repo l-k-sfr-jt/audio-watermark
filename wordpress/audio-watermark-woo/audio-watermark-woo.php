@@ -3,7 +3,7 @@
  * Plugin Name: Audio Watermark for WooCommerce
  * Plugin URI:  https://github.com/your-org/audio-watermark
  * Description: Embeds a unique forensic watermark (buyer's order ID) into audiobook WAV files so leaked copies can be traced back to the buyer.
- * Version:     1.1.0
+ * Version:     1.2.0
  * Author:      Audio Watermark
  * Requires at least: 5.8
  * Requires PHP: 7.4
@@ -14,7 +14,7 @@
 
 defined( 'ABSPATH' ) || exit;
 
-define( 'AUDIO_WM_VERSION',    '1.1.0' );
+define( 'AUDIO_WM_VERSION',    '1.2.0' );
 define( 'AUDIO_WM_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'AUDIO_WM_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
 
