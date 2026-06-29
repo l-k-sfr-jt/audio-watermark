@@ -89,9 +89,17 @@ credentials work. Fix any ✗ items before continuing.
 ```bash
 ./scripts/deploy.sh
 ```
-Builds the image and creates the S3 bucket, Lambda, API Gateway, API key, and
-usage plan. The first run uses `sam deploy --guided` (accept the defaults; they
-are pre-filled from `samconfig.toml`). When it finishes it prints:
+Builds the image and creates the S3 bucket, Lambda, API Gateway, API key, usage
+plan, and the **CloudFront distribution** that delivers buyer audio. Before
+building, the script auto-generates an RSA 2048 signing key pair and stores it in
+SSM (private key as a SecureString, public key as a String) — this is idempotent,
+so re-runs reuse the existing keys. The first run uses `sam deploy --guided`
+(accept the defaults; they are pre-filled from `samconfig.toml`).
+
+> ⏱️ **First deploy is slow** — creating the CloudFront distribution takes
+> ~15–20 minutes. Subsequent deploys that don't change CloudFront are quick.
+
+When it finishes it prints:
 
 ```
   API base URL : https://xxxx.execute-api.eu-central-1.amazonaws.com/Prod

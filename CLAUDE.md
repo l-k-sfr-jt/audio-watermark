@@ -9,9 +9,10 @@ back to the buyer via the WooCommerce order ID.
 ```
 src/
   handler.py      # Lambda entry point — routes /products/upload-url and /watermark
-  watermark.py    # Core DCT algorithm: embed_watermark() / detect_watermark() / transcode_to_mp3()
+  watermark.py    # Core DCT algorithm: embed_watermark() / detect_watermark() / embed_mp3() / transcode_to_mp3()
                   #   *** NO boto3/AWS imports allowed here — must stay portable ***
-  storage.py      # S3 helpers: download, upload, presign GET/PUT, object_exists (boto3)
+  storage.py      # S3 + CloudFront helpers: download, upload, object_exists, presign PUT,
+                  #   CloudFront-signed (or S3-presigned) GET (boto3 + cryptography)
 tests/
   test_watermark.py   # Unit tests: embed/detect roundtrip + MP3 robustness
   sample_audio/       # Short test .mp3 / .wav fixtures
@@ -47,8 +48,16 @@ whole window (block `i` carries bit `i % 32`), so a quiet intro can't wipe out
 any single bit. Embedding is **perceptual**: a masking envelope is built per
 block by spreading the host's band magnitude across `±SPREAD_BINS` neighbours,
 and the mark is scaled to it (`ALPHA × envelope`). Detection **whitens** before
-correlating. Output of `embed_watermark()` is always WAV (PCM 16-bit); the
-handler calls `transcode_to_mp3()` to convert the result to MP3 128 kbps.
+correlating. Output of `embed_watermark()` is always WAV (PCM 16-bit).
+
+The handler's mux entry point is **`embed_mp3()`**, which writes the final MP3
+directly. For an MP3 master longer than the ~12 s marked head it **stream-copies**:
+only the watermarked head is re-encoded (at the source's own bitrate) and the
+untouched tail is concatenated with `ffmpeg -c copy`, so the tail stays
+bit-identical to the master — zero quality loss, near-instant (a 42-min chapter
+processes in ~3 s instead of re-encoding the whole file). It falls back to the
+full `embed_watermark()` → `transcode_to_mp3()` (128 kbps) path for non-MP3
+masters, very short files, or if the stream-copy mux fails for any reason.
 
 **Memory-bounded embed**: only the first `_REQUIRED` samples (~12 s at 44.1 kHz)
 are decoded into numpy. For longer files the untouched tail is stitched back via
@@ -89,7 +98,7 @@ the file directly to S3 — no AWS keys in WordPress.
 
 ### POST /watermark (idempotent)
 Request: `{ "master_key": "masters/123/chapter-01.wav", "order_id": 456789, "item_id": 7, "part": "chapter-01" }`
-Response: `{ "download_url": "https://s3.amazonaws.com/presigned-get...", "watermark_code": 456789, "from_cache": false }`
+Response: `{ "download_url": "https://d111abcdef8.cloudfront.net/orders/456789/7/chapter-01.mp3?Expires=...&Signature=...&Key-Pair-Id=...", "watermark_code": 456789, "from_cache": false }`
 
 `order_id` (numeric WooCommerce order ID) is embedded as the 32-bit watermark
 code. `item_id` (optional, WooCommerce order-item ID) namespaces the stored copy
@@ -98,10 +107,13 @@ further namespaces per master file within one item, enabling multi-file/chapter
 audiobooks. Output key precedence: `orders/<order_id>/<item_id>/<part>.mp3` →
 `orders/<order_id>/<item_id>.mp3` → `orders/<order_id>.mp3`. The embedded code
 is always `order_id`, so forensic tracing is per-order. If the target copy already
-exists in S3 the call just presigns it (fast path, `from_cache: true`). After the
+exists in S3 the call just re-signs it (fast path, `from_cache: true`). After the
 30-day S3 lifecycle expiry the slow path (re-watermark from master) runs
-automatically on the next request. The presigned GET includes
-`Content-Disposition: attachment; filename="<stem>_order<order_id>.mp3"`.
+automatically on the next request. `download_url` is a **CloudFront signed URL**
+(1 h expiry) when CloudFront is configured, otherwise an S3 presigned GET. The
+attachment filename `<stem>_order<order_id>.mp3` is stored on the object as
+`Content-Disposition` at upload time (CloudFront carries no query-param filename),
+so it is honoured on both delivery paths.
 
 The WooCommerce order handler and download handler always send the **same**
 `item_id` and `part`, so a buyer's "Download" click resolves to exactly the copy
@@ -116,11 +128,24 @@ made for that line item's chapter.
 | `orders/<order_id>/<item_id>.mp3`           | Buyer copy, per line item (single-file product) | 30-day expiry |
 | `orders/<order_id>.mp3`                     | Buyer copy when no item_id (web console)       | 30-day expiry |
 
+Buyer downloads of `orders/*` are served through **CloudFront** (Origin Access
+Control–only bucket policy; the bucket itself blocks all public access). The
+`masters/*` prefix is never exposed via CloudFront — admins upload masters with a
+presigned S3 PUT only.
+
 ## Environment Variables (Lambda)
 
-| Variable      | Description                           |
-|---------------|---------------------------------------|
-| `BUCKET_NAME` | S3 bucket for all audio               |
+| Variable               | Description                                                  |
+|------------------------|--------------------------------------------------------------|
+| `BUCKET_NAME`          | S3 bucket for all audio                                       |
+| `CF_DOMAIN`            | CloudFront distribution domain (enables signed-URL delivery)  |
+| `CF_KEY_ID`            | CloudFront public-key ID used to verify signed URLs           |
+| `CF_PRIVATE_KEY_PARAM` | SSM SecureString path holding the CloudFront signing key      |
+
+When `CF_DOMAIN` / `CF_KEY_ID` / `CF_PRIVATE_KEY_PARAM` are unset, `storage.py`
+falls back to S3 presigned GET URLs, so the service still works without
+CloudFront (e.g. local/dev). `deploy.sh` auto-creates the RSA key pair in SSM on
+first deploy.
 
 ## Observability
 
@@ -145,9 +170,13 @@ Dimensions: `{"Service": "audio-watermark"}`. All log entries are structured JSO
 2. All S3 calls live exclusively in `storage.py`.
 3. The Lambda is packaged as a **container image** (`Dockerfile`), not zip —
    ffmpeg and scipy are bundled. Deploy via `scripts/deploy.sh`.
-4. Presigned GET URLs use the Lambda execution role (1 h expiry). Since buyer
-   copies are re-minted on every download, they are always fresh before the
-   STS session (≤12 h) could expire.
+4. Buyer download URLs are **CloudFront signed URLs** (1 h expiry): the viewer
+   request is verified at the edge against a trusted key group, and CloudFront
+   reaches the private S3 origin via Origin Access Control. The signing private
+   key lives in SSM (SecureString) and is read+cached by `storage.py`. When
+   CloudFront env vars are absent, `storage.py` falls back to S3 presigned GETs
+   signed with the Lambda execution role. Either way the URL is re-minted on
+   every download, so it is always fresh well before any session expiry.
 5. SES is not used — WordPress handles all customer email.
 
 ## WooCommerce Plugin (wordpress/audio-watermark-woo/)

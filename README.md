@@ -30,8 +30,9 @@ and storing the buyer copies under `orders/<order_id>/<item_id>/` (or
 `/<item_id>.mp3` for single-file products). The buyer — even a guest with no WP
 login — gets a delivery email with one download link per part plus a "request a
 new link" link, and the same buttons on the order-received/thank-you page (logged-
-in buyers also see them in My Account). Each click mints a fresh 1-hour presigned
-URL. Email/thank-you links are signed with an order-key HMAC and expire after 30
+in buyers also see them in My Account). Each click mints a fresh 1-hour CloudFront
+signed URL (S3 presigned GET as a fallback when CloudFront isn't configured).
+Email/thank-you links are signed with an order-key HMAC and expire after 30
 days, matching the S3 lifecycle; an expired link self-serves a fresh one (resend
 throttled to once per hour). Stored copies auto-expire after 30 days and are
 re-created transparently from the master on the next download. To trace a leak,
@@ -40,7 +41,7 @@ run `cli.py detect` on the file; the recovered code is the order ID.
 ```
 ADMIN ── upload masters (1–N) ──▶ S3 masters/<product_id>/<file>
 ORDER processing/completed ── POST /watermark (per part) ──▶ embed order_id → MP3 → S3 orders/<order_id>/<item_id>/<part>.mp3
-BUYER ── email link / thank-you page / My Account (one per part) ──▶ fresh presigned GET
+BUYER ── email link / thank-you page / My Account (one per part) ──▶ fresh CloudFront signed URL (S3 presigned fallback)
 LEAK ── cli.py detect ──▶ order_id ──▶ WooCommerce order ──▶ buyer
 ```
 
@@ -92,8 +93,8 @@ the order ID.
 ```
 src/
   handler.py    # Lambda entry — routes /products/upload-url and /watermark
-  watermark.py  # DCT algorithm: embed/detect + transcode_to_mp3 (NO AWS imports)
-  storage.py    # S3 helpers: download/upload/object_exists/presign (boto3)
+  watermark.py  # DCT algorithm: embed/detect + embed_mp3 stream-copy mux (NO AWS imports)
+  storage.py    # S3/CloudFront helpers: download/upload/object_exists, signed-URL GET (boto3)
 tests/
   test_watermark.py   # embed/detect roundtrip + MP3 robustness
   sample_audio/       # short test fixtures
@@ -119,7 +120,7 @@ wordpress/
 | Endpoint | Purpose |
 |----------|---------|
 | `POST /products/upload-url` | Returns a presigned S3 PUT (15 min) so a browser uploads a master directly. |
-| `POST /watermark` | Idempotent: watermark one master for an order ID and return a presigned GET (1 h). Accepts optional `item_id` and `part` for per-chapter multi-file delivery. Serves both first purchase and re-download. |
+| `POST /watermark` | Idempotent: watermark one master for an order ID and return a CloudFront signed URL (1 h; S3 presigned fallback). Accepts optional `item_id` and `part` for per-chapter multi-file delivery. Serves both first purchase and re-download. |
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full request/response
 contract and validation rules.

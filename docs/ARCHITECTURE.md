@@ -45,14 +45,19 @@ flowchart TB
     DH -->|"POST /watermark"| APIGW
     APIGW --> L
     L --> S3
-    L -->|"presigned GET URL"| APIGW
-    BROWSER -->|"302 → presigned GET"| S3
+    L -->|"CloudFront signed URL"| APIGW
+    BROWSER -->|"302 → signed URL"| CF
+    CF -->|"OAC (SigV4) origin fetch"| S3
 ```
+
+(`CF` = CloudFront distribution fronting `orders/*`. When CloudFront is not
+configured the Lambda returns an S3 presigned GET instead and the browser is
+redirected straight to S3.)
 
 | Component | File | Responsibility |
 |-----------|------|----------------|
-| Watermark core | `src/watermark.py` | DCT spread-spectrum embed/detect, MP3 transcode. **No AWS imports.** |
-| S3 helpers | `src/storage.py` | download, upload, `object_exists`, presigned PUT/GET. **Only file with boto3.** |
+| Watermark core | `src/watermark.py` | DCT spread-spectrum embed/detect; `embed_mp3` stream-copy mux + MP3 transcode fallback. **No AWS imports.** |
+| S3 / CloudFront helpers | `src/storage.py` | download, upload, `object_exists`, presigned PUT; CloudFront-signed (or S3-presigned) GET — reads the signing key from SSM. **Only file with boto3/cryptography.** |
 | Lambda router | `src/handler.py` | Routes `/products/upload-url` and `/watermark`; input validation; idempotency. |
 | Local CLI | `cli.py` | `embed` / `detect` / `roundtrip-test` without AWS (used for forensic detection). |
 | Infra | `template.yaml` | S3 bucket, Lambda, API Gateway, API key, usage plan. |
@@ -97,10 +102,13 @@ Request:
 
 Response:
 ```json
-{ "download_url": "https://s3...presigned-get", "watermark_code": 456789, "from_cache": false }
+{ "download_url": "https://d111abcdef8.cloudfront.net/orders/456789/7/chapter-01.mp3?Expires=…&Signature=…&Key-Pair-Id=…", "watermark_code": 456789, "from_cache": false }
 ```
 
-The `download_url` is a presigned GET with `Content-Disposition: attachment; filename="<stem>_order<order_id>.mp3"` so the browser saves a meaningful filename.
+The `download_url` is a **CloudFront signed URL** (or an S3 presigned GET when
+CloudFront isn't configured). The `Content-Disposition: attachment; filename="<stem>_order<order_id>.mp3"`
+that makes the browser save a meaningful filename is stored on the S3 object at
+upload time, so it applies on both delivery paths.
 
 Validation (`route_watermark`):
 - `master_key` required, **must start with `masters/`**, must not contain `..` segments.
@@ -110,7 +118,9 @@ Validation (`route_watermark`):
   embedded code.
 - `part` **optional**; sanitized filename stem (e.g. `"chapter-01"`); only valid
   when `item_id` is also present; must match `^[A-Za-z0-9._\-]+$`, max 128 chars.
-- Presigned GET expiry: **3600 s (1 h)**, signed with the Lambda execution role.
+- Download URL expiry: **3600 s (1 h)**. CloudFront signed URLs are signed with
+  the RSA private key in SSM (`CF_PRIVATE_KEY_PARAM`); the S3-presigned fallback
+  is signed with the Lambda execution role.
 
 Output key (precedence):
 | Inputs | Output key |
@@ -121,10 +131,14 @@ Output key (precedence):
 
 Behaviour:
 - **Fast path** — if the target copy already exists (`object_exists`), return a
-  fresh presigned GET with `from_cache: true`. No re-embedding.
-- **Slow path** — download master → `embed_watermark(order_id)` →
-  `transcode_to_mp3` (128 kbps) → upload to the output key → presign,
-  `from_cache: false`.
+  fresh signed URL with `from_cache: true`. No re-embedding.
+- **Slow path** — download master → `embed_mp3(order_id)` → upload to the output
+  key (with the `Content-Disposition` filename) → sign, `from_cache: false`.
+  `embed_mp3` **stream-copies** an MP3 master: it re-encodes only the ~12 s
+  watermarked head and concatenates the original tail with `ffmpeg -c copy`
+  (bit-identical, no quality loss). It falls back to
+  `embed_watermark` → `transcode_to_mp3` (128 kbps) for non-MP3 / very short
+  masters, or if the stream-copy mux fails.
 
 > The embedded watermark code is always `order_id`, independent of `item_id` and
 > `part`, so forensic tracing remains per-order (the buyer). Per-item and per-part
@@ -233,9 +247,12 @@ the binary through WordPress.
       the order.
   - Both models also enforce the item-belongs-to-order check
     (`$order->get_item($item_id)`) + open-redirect guard (URL host must end with
-    `.amazonaws.com` and scheme `https`).
+    `.amazonaws.com` or `.cloudfront.net` and scheme `https`).
 - **Least-privilege IAM:** Lambda gets only `s3:GetObject`/`PutObject` on
-  `masters/*` + `orders/*` and `s3:HeadObject` on `orders/*` — no delete, no list.
+  `masters/*` + `orders/*`, `s3:HeadObject` on `orders/*`, and `ssm:GetParameter`
+  on the CloudFront signing key — no delete, no list. Buyer downloads of
+  `orders/*` reach S3 only through CloudFront Origin Access Control (the bucket
+  blocks all public access).
 - **No long-lived AWS keys in WordPress:** browser PUTs via presigned URL; the
   WP server only ever holds the API key.
 - **No SES:** all customer email is handled by WordPress.
